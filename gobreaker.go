@@ -312,8 +312,8 @@ func NewCircuitBreaker(st Settings) *CircuitBreaker {
 		cb.isSuccessful = st.IsSuccessful
 	}
 
-	cb.counts.LoadFromRedis()
 	cb.counts.CB = cb
+	cb.counts.LoadFromRedis()
 
 	cb.toNewGeneration(time.Now())
 
