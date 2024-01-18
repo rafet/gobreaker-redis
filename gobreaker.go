@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"github.com/go-redis/redis"
 )
 
 // State is a type that represents a state of CircuitBreaker.
@@ -50,30 +52,113 @@ type Counts struct {
 	TotalFailures        uint32
 	ConsecutiveSuccesses uint32
 	ConsecutiveFailures  uint32
+
+	CB *CircuitBreaker
 }
 
 func (c *Counts) onRequest() {
-	c.Requests++
+	key := fmt.Sprintf("%s:%s:cb:counts", c.CB.redisKeyPrefix, c.CB.name)
+	c.CB.redisClient.Incr(key)
+	// c.Requests++
 }
 
 func (c *Counts) onSuccess() {
-	c.TotalSuccesses++
-	c.ConsecutiveSuccesses++
-	c.ConsecutiveFailures = 0
+	key := fmt.Sprintf("%s:%s:cb:successes", c.CB.redisKeyPrefix, c.CB.name)
+	c.CB.redisClient.Incr(key)
+
+	key = fmt.Sprintf("%s:%s:cb:consecutive_successes", c.CB.redisKeyPrefix, c.CB.name)
+	c.CB.redisClient.Incr(key)
+
+	key = fmt.Sprintf("%s:%s:cb:consecutive_failures", c.CB.redisKeyPrefix, c.CB.name)
+	c.CB.redisClient.Set(key, 0, 0)
+	//c.TotalSuccesses++
+	//c.ConsecutiveSuccesses++
+	//c.ConsecutiveFailures = 0
 }
 
 func (c *Counts) onFailure() {
-	c.TotalFailures++
-	c.ConsecutiveFailures++
-	c.ConsecutiveSuccesses = 0
+	key := fmt.Sprintf("%s:%s:cb:failures", c.CB.redisKeyPrefix, c.CB.name)
+	c.CB.redisClient.Incr(key)
+
+	key = fmt.Sprintf("%s:%s:cb:consecutive_failures", c.CB.redisKeyPrefix, c.CB.name)
+	c.CB.redisClient.Incr(key)
+
+	key = fmt.Sprintf("%s:%s:cb:consecutive_successes", c.CB.redisKeyPrefix, c.CB.name)
+	c.CB.redisClient.Set(key, 0, 0)
+
+	//c.TotalFailures++
+	//c.ConsecutiveFailures++
+	//c.ConsecutiveSuccesses = 0
 }
 
 func (c *Counts) clear() {
-	c.Requests = 0
-	c.TotalSuccesses = 0
-	c.TotalFailures = 0
-	c.ConsecutiveSuccesses = 0
-	c.ConsecutiveFailures = 0
+	keys := []string{
+		fmt.Sprintf("%s:%s:cb:counts", c.CB.redisKeyPrefix, c.CB.name),
+		fmt.Sprintf("%s:%s:cb:successes", c.CB.redisKeyPrefix, c.CB.name),
+		fmt.Sprintf("%s:%s:cb:failures", c.CB.redisKeyPrefix, c.CB.name),
+		fmt.Sprintf("%s:%s:cb:consecutive_successes", c.CB.redisKeyPrefix, c.CB.name),
+		fmt.Sprintf("%s:%s:cb:consecutive_failures", c.CB.redisKeyPrefix, c.CB.name),
+	}
+	c.CB.redisClient.Del(keys...)
+
+	//c.Requests = 0
+	//c.TotalSuccesses = 0
+	//c.TotalFailures = 0
+	//c.ConsecutiveSuccesses = 0
+	//c.ConsecutiveFailures = 0
+}
+
+func (c *Counts) getConsecutiveSuccesses() uint32 {
+	key := fmt.Sprintf("%s:%s:cb:consecutive_successes", c.CB.redisKeyPrefix, c.CB.name)
+	val, err := c.CB.redisClient.Get(key).Uint64()
+	if err != nil {
+		return 0
+	}
+	return uint32(val)
+}
+
+func (c *Counts) getConsecutiveFailures() uint32 {
+	key := fmt.Sprintf("%s:%s:cb:consecutive_failures", c.CB.redisKeyPrefix, c.CB.name)
+	val, err := c.CB.redisClient.Get(key).Uint64()
+	if err != nil {
+		return 0
+	}
+	return uint32(val)
+}
+
+func (c *Counts) getSuccesses() uint32 {
+	key := fmt.Sprintf("%s:%s:cb:successes", c.CB.redisKeyPrefix, c.CB.name)
+	val, err := c.CB.redisClient.Get(key).Uint64()
+	if err != nil {
+		return 0
+	}
+	return uint32(val)
+}
+
+func (c *Counts) getFailures() uint32 {
+	key := fmt.Sprintf("%s:%s:cb:failures", c.CB.redisKeyPrefix, c.CB.name)
+	val, err := c.CB.redisClient.Get(key).Uint64()
+	if err != nil {
+		return 0
+	}
+	return uint32(val)
+}
+
+func (c *Counts) getRequests() uint32 {
+	key := fmt.Sprintf("%s:%s:cb:counts", c.CB.redisKeyPrefix, c.CB.name)
+	val, err := c.CB.redisClient.Get(key).Uint64()
+	if err != nil {
+		return 0
+	}
+	return uint32(val)
+}
+
+func (c *Counts) LoadFromRedis() {
+	c.Requests = c.getRequests()
+	c.TotalSuccesses = c.getSuccesses()
+	c.TotalFailures = c.getFailures()
+	c.ConsecutiveSuccesses = c.getConsecutiveSuccesses()
+	c.ConsecutiveFailures = c.getConsecutiveFailures()
 }
 
 // Settings configures CircuitBreaker:
@@ -111,6 +196,9 @@ type Settings struct {
 	ReadyToTrip   func(counts Counts) bool
 	OnStateChange func(name string, from State, to State)
 	IsSuccessful  func(err error) bool
+
+	RedisClient    *redis.Client
+	RedisKeyPrefix string
 }
 
 // CircuitBreaker is a state machine to prevent sending requests that are likely to fail.
@@ -123,11 +211,54 @@ type CircuitBreaker struct {
 	isSuccessful  func(err error) bool
 	onStateChange func(name string, from State, to State)
 
-	mutex      sync.Mutex
-	state      State
-	generation uint64
-	counts     Counts
-	expiry     time.Time
+	mutex  sync.Mutex
+	state  State
+	counts Counts
+
+	redisClient    *redis.Client
+	redisKeyPrefix string
+}
+
+func (cb *CircuitBreaker) getState() State {
+	key := fmt.Sprintf("%s:%s:cb:state", cb.redisKeyPrefix, cb.name)
+	val, err := cb.redisClient.Get(key).Int64()
+	if err != nil {
+		return 0
+	}
+	return State(val)
+}
+
+func (cb *CircuitBreaker) _setState(state State) {
+	key := fmt.Sprintf("%s:%s:cb:state", cb.redisKeyPrefix, cb.name)
+	cb.redisClient.Set(key, state, 0)
+}
+
+func (cb *CircuitBreaker) getGeneration() uint64 {
+	key := fmt.Sprintf("%s:%s:cb:generation", cb.redisKeyPrefix, cb.name)
+	val, err := cb.redisClient.Get(key).Uint64()
+	if err != nil {
+		return 0
+	}
+	return val
+}
+
+func (cb *CircuitBreaker) incrGeneration() {
+	key := fmt.Sprintf("%s:%s:cb:generation", cb.redisKeyPrefix, cb.name)
+	cb.redisClient.Incr(key)
+}
+
+func (cb *CircuitBreaker) getExpiry() time.Time {
+	key := fmt.Sprintf("%s:%s:cb:time:open", cb.redisKeyPrefix, cb.name)
+	val, err := cb.redisClient.Get(key).Int64()
+	if err != nil {
+		return time.Time{}
+	}
+	return time.Unix(0, val)
+}
+
+func (cb *CircuitBreaker) setExpiry(expiry time.Time) {
+	key := fmt.Sprintf("%s:%s:cb:time:open", cb.redisKeyPrefix, cb.name)
+	cb.redisClient.Set(key, expiry.UnixNano(), 0)
 }
 
 // TwoStepCircuitBreaker is like CircuitBreaker but instead of surrounding a function
@@ -141,8 +272,15 @@ type TwoStepCircuitBreaker struct {
 func NewCircuitBreaker(st Settings) *CircuitBreaker {
 	cb := new(CircuitBreaker)
 
+	if st.RedisClient == nil {
+		panic("redis client is nil")
+	} else {
+		cb.redisClient = st.RedisClient
+	}
+
 	cb.name = st.Name
 	cb.onStateChange = st.OnStateChange
+	cb.redisKeyPrefix = st.RedisKeyPrefix
 
 	if st.MaxRequests == 0 {
 		cb.maxRequests = 1
@@ -174,6 +312,9 @@ func NewCircuitBreaker(st Settings) *CircuitBreaker {
 		cb.isSuccessful = st.IsSuccessful
 	}
 
+	cb.counts.LoadFromRedis()
+	cb.counts.CB = cb
+
 	cb.toNewGeneration(time.Now())
 
 	return cb
@@ -190,7 +331,7 @@ const defaultInterval = time.Duration(0) * time.Second
 const defaultTimeout = time.Duration(60) * time.Second
 
 func defaultReadyToTrip(counts Counts) bool {
-	return counts.ConsecutiveFailures > 5
+	return counts.getConsecutiveFailures() > 5
 }
 
 func defaultIsSuccessful(err error) bool {
@@ -316,6 +457,7 @@ func (cb *CircuitBreaker) onSuccess(state State, now time.Time) {
 		if cb.counts.ConsecutiveSuccesses >= cb.maxRequests {
 			cb.setState(StateClosed, now)
 		}
+	default:
 	}
 }
 
@@ -328,30 +470,34 @@ func (cb *CircuitBreaker) onFailure(state State, now time.Time) {
 		}
 	case StateHalfOpen:
 		cb.setState(StateOpen, now)
+	default:
 	}
 }
 
 func (cb *CircuitBreaker) currentState(now time.Time) (State, uint64) {
-	switch cb.state {
+	expiry := cb.getExpiry()
+	switch cb.getState() {
 	case StateClosed:
-		if !cb.expiry.IsZero() && cb.expiry.Before(now) {
+		if !expiry.IsZero() && expiry.Before(now) {
 			cb.toNewGeneration(now)
 		}
 	case StateOpen:
-		if cb.expiry.Before(now) {
+		if expiry.Before(now) {
 			cb.setState(StateHalfOpen, now)
 		}
+	default:
 	}
-	return cb.state, cb.generation
+	return cb.getState(), cb.getGeneration()
 }
 
 func (cb *CircuitBreaker) setState(state State, now time.Time) {
-	if cb.state == state {
+	cbState := cb.getState()
+	if cbState == state {
 		return
 	}
 
-	prev := cb.state
-	cb.state = state
+	prev := cbState
+	cb._setState(state)
 
 	cb.toNewGeneration(now)
 
@@ -361,20 +507,21 @@ func (cb *CircuitBreaker) setState(state State, now time.Time) {
 }
 
 func (cb *CircuitBreaker) toNewGeneration(now time.Time) {
-	cb.generation++
+	//cb.generation++
+	cb.incrGeneration()
 	cb.counts.clear()
 
 	var zero time.Time
-	switch cb.state {
+	switch cb.getState() {
 	case StateClosed:
 		if cb.interval == 0 {
-			cb.expiry = zero
+			cb.setExpiry(zero)
 		} else {
-			cb.expiry = now.Add(cb.interval)
+			cb.setExpiry(now.Add(cb.interval))
 		}
 	case StateOpen:
-		cb.expiry = now.Add(cb.timeout)
+		cb.setExpiry(now.Add(cb.timeout))
 	default: // StateHalfOpen
-		cb.expiry = zero
+		cb.setExpiry(zero)
 	}
 }
