@@ -9,7 +9,7 @@ Installation
 ------------
 
 ```
-go get github.com/sony/gobreaker
+go get github.com/rafet/gobreaker-redis
 ```
 
 Usage
