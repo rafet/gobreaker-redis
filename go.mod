@@ -1,4 +1,4 @@
-module github.com/sony/gobreaker
+module github.com/rafet/gobreaker-redis
 
 go 1.18
 
