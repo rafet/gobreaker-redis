@@ -108,7 +108,7 @@ func (c *Counts) clear() {
 	//c.ConsecutiveFailures = 0
 }
 
-func (c *Counts) getConsecutiveSuccesses() uint32 {
+func (c *Counts) GetConsecutiveSuccesses() uint32 {
 	key := fmt.Sprintf("%s:%s:cb:consecutive_successes", c.CB.redisKeyPrefix, c.CB.name)
 	val, err := c.CB.redisClient.Get(key).Uint64()
 	if err != nil {
@@ -117,7 +117,7 @@ func (c *Counts) getConsecutiveSuccesses() uint32 {
 	return uint32(val)
 }
 
-func (c *Counts) getConsecutiveFailures() uint32 {
+func (c *Counts) GetConsecutiveFailures() uint32 {
 	key := fmt.Sprintf("%s:%s:cb:consecutive_failures", c.CB.redisKeyPrefix, c.CB.name)
 	val, err := c.CB.redisClient.Get(key).Uint64()
 	if err != nil {
@@ -126,7 +126,7 @@ func (c *Counts) getConsecutiveFailures() uint32 {
 	return uint32(val)
 }
 
-func (c *Counts) getSuccesses() uint32 {
+func (c *Counts) GetSuccesses() uint32 {
 	key := fmt.Sprintf("%s:%s:cb:successes", c.CB.redisKeyPrefix, c.CB.name)
 	val, err := c.CB.redisClient.Get(key).Uint64()
 	if err != nil {
@@ -135,7 +135,7 @@ func (c *Counts) getSuccesses() uint32 {
 	return uint32(val)
 }
 
-func (c *Counts) getFailures() uint32 {
+func (c *Counts) GetFailures() uint32 {
 	key := fmt.Sprintf("%s:%s:cb:failures", c.CB.redisKeyPrefix, c.CB.name)
 	val, err := c.CB.redisClient.Get(key).Uint64()
 	if err != nil {
@@ -144,7 +144,7 @@ func (c *Counts) getFailures() uint32 {
 	return uint32(val)
 }
 
-func (c *Counts) getRequests() uint32 {
+func (c *Counts) GetRequests() uint32 {
 	key := fmt.Sprintf("%s:%s:cb:counts", c.CB.redisKeyPrefix, c.CB.name)
 	val, err := c.CB.redisClient.Get(key).Uint64()
 	if err != nil {
@@ -154,11 +154,11 @@ func (c *Counts) getRequests() uint32 {
 }
 
 func (c *Counts) LoadFromRedis() {
-	c.Requests = c.getRequests()
-	c.TotalSuccesses = c.getSuccesses()
-	c.TotalFailures = c.getFailures()
-	c.ConsecutiveSuccesses = c.getConsecutiveSuccesses()
-	c.ConsecutiveFailures = c.getConsecutiveFailures()
+	c.Requests = c.GetRequests()
+	c.TotalSuccesses = c.GetSuccesses()
+	c.TotalFailures = c.GetFailures()
+	c.ConsecutiveSuccesses = c.GetConsecutiveSuccesses()
+	c.ConsecutiveFailures = c.GetConsecutiveFailures()
 }
 
 // Settings configures CircuitBreaker:
@@ -258,6 +258,11 @@ func (cb *CircuitBreaker) getExpiry() time.Time {
 
 func (cb *CircuitBreaker) setExpiry(expiry time.Time) {
 	key := fmt.Sprintf("%s:%s:cb:time:open", cb.redisKeyPrefix, cb.name)
+	if expiry.IsZero() {
+		cb.redisClient.Del(key)
+		return
+	}
+
 	cb.redisClient.Set(key, expiry.UnixNano(), 0)
 }
 
@@ -331,7 +336,7 @@ const defaultInterval = time.Duration(0) * time.Second
 const defaultTimeout = time.Duration(60) * time.Second
 
 func defaultReadyToTrip(counts Counts) bool {
-	return counts.getConsecutiveFailures() > 5
+	return counts.GetConsecutiveFailures() > 5
 }
 
 func defaultIsSuccessful(err error) bool {
