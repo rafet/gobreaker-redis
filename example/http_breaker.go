@@ -6,7 +6,7 @@ import (
 	"log"
 	"net/http"
 
-	"github.com/sony/gobreaker"
+	gobreaker "github.com/rafet/gobreaker-redis"
 )
 
 var cb *gobreaker.CircuitBreaker
