@@ -230,7 +230,7 @@ func (cb *CircuitBreaker) getState() State {
 
 func (cb *CircuitBreaker) _setState(state State) {
 	key := fmt.Sprintf("%s:%s:cb:state", cb.redisKeyPrefix, cb.name)
-	cb.redisClient.Set(key, state, 0)
+	cb.redisClient.Set(key, int(state), cb.timeout)
 }
 
 func (cb *CircuitBreaker) getGeneration() uint64 {
@@ -242,28 +242,25 @@ func (cb *CircuitBreaker) getGeneration() uint64 {
 	return val
 }
 
-func (cb *CircuitBreaker) incrGeneration() {
+func (cb *CircuitBreaker) incrGeneration() int {
 	key := fmt.Sprintf("%s:%s:cb:generation", cb.redisKeyPrefix, cb.name)
-	cb.redisClient.Incr(key)
+	return int(cb.redisClient.Incr(key).Val())
 }
 
 func (cb *CircuitBreaker) getExpiry() time.Time {
 	key := fmt.Sprintf("%s:%s:cb:time:open", cb.redisKeyPrefix, cb.name)
 	val, err := cb.redisClient.Get(key).Int64()
-	if err != nil {
+	t := time.Unix(val, 0)
+	if t.IsZero() || err != nil {
 		return time.Time{}
 	}
-	return time.Unix(0, val)
+
+	return t
 }
 
 func (cb *CircuitBreaker) setExpiry(expiry time.Time) {
 	key := fmt.Sprintf("%s:%s:cb:time:open", cb.redisKeyPrefix, cb.name)
-	if expiry.IsZero() {
-		cb.redisClient.Del(key)
-		return
-	}
-
-	cb.redisClient.Set(key, expiry.UnixNano(), 0)
+	cb.redisClient.Set(key, expiry.Unix(), 0)
 }
 
 // TwoStepCircuitBreaker is like CircuitBreaker but instead of surrounding a function
@@ -320,7 +317,9 @@ func NewCircuitBreaker(st Settings) *CircuitBreaker {
 	cb.counts.CB = cb
 	cb.counts.LoadFromRedis()
 
-	cb.toNewGeneration(time.Now())
+	if cb.redisClient.Exists(fmt.Sprintf("%s:%s:cb:generation", cb.redisKeyPrefix, cb.name)).Val() == 0 {
+		cb.toNewGeneration(time.Now())
+	}
 
 	return cb
 }
@@ -336,7 +335,7 @@ const defaultInterval = time.Duration(0) * time.Second
 const defaultTimeout = time.Duration(60) * time.Second
 
 func defaultReadyToTrip(counts Counts) bool {
-	return counts.GetConsecutiveFailures() > 5
+	return counts.GetConsecutiveFailures() > 2
 }
 
 func defaultIsSuccessful(err error) bool {
@@ -428,7 +427,7 @@ func (cb *CircuitBreaker) beforeRequest() (uint64, error) {
 
 	if state == StateOpen {
 		return generation, ErrOpenState
-	} else if state == StateHalfOpen && cb.counts.Requests >= cb.maxRequests {
+	} else if state == StateHalfOpen && cb.counts.GetRequests() >= cb.maxRequests {
 		return generation, ErrTooManyRequests
 	}
 
@@ -459,7 +458,7 @@ func (cb *CircuitBreaker) onSuccess(state State, now time.Time) {
 		cb.counts.onSuccess()
 	case StateHalfOpen:
 		cb.counts.onSuccess()
-		if cb.counts.ConsecutiveSuccesses >= cb.maxRequests {
+		if cb.counts.GetConsecutiveSuccesses() >= cb.maxRequests {
 			cb.setState(StateClosed, now)
 		}
 	default:
@@ -525,7 +524,10 @@ func (cb *CircuitBreaker) toNewGeneration(now time.Time) {
 			cb.setExpiry(now.Add(cb.interval))
 		}
 	case StateOpen:
-		cb.setExpiry(now.Add(cb.timeout))
+		expiry := cb.getExpiry()
+		if expiry.IsZero() {
+			cb.setExpiry(now.Add(cb.timeout))
+		}
 	default: // StateHalfOpen
 		cb.setExpiry(zero)
 	}
