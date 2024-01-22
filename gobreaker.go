@@ -194,7 +194,7 @@ func (cb *CircuitBreaker) getState() State {
 
 func (cb *CircuitBreaker) _setState(state State) {
 	key := fmt.Sprintf("%s:%s:cb:state", cb.redisKeyPrefix, cb.name)
-	cb.redisClient.Set(key, int(state), cb.timeout)
+	cb.redisClient.Set(key, int(state), 0)
 }
 
 func (cb *CircuitBreaker) getGeneration() uint64 {
