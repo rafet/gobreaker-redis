@@ -22,8 +22,6 @@ const (
 )
 
 var (
-	// ErrTooManyRequests is returned when the CB state is half open and the requests count is over the cb maxRequests
-	ErrTooManyRequests = errors.New("too many requests")
 	// ErrOpenState is returned when the CB state is open
 	ErrOpenState = errors.New("circuit breaker is open")
 )
@@ -392,12 +390,10 @@ func (cb *CircuitBreaker) beforeRequest() (uint64, error) {
 	now := time.Now()
 	state, generation := cb.currentState(now)
 
-	requestsCount := cb.counts.onRequest()
+	cb.counts.onRequest()
 
 	if state == StateOpen {
 		return generation, ErrOpenState
-	} else if state == StateHalfOpen && requestsCount >= cb.maxRequests {
-		return generation, ErrTooManyRequests
 	}
 
 	return generation, nil
