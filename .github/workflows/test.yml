@@ -1,24 +1,116 @@
-on: [push, pull_request]
 name: Test
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
 jobs:
   test:
+    name: Test (Go ${{ matrix.go }})
+    runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        go-version: [1.20.x, 1.21.x]
-        os: [ubuntu-latest]
-    runs-on: ${{matrix.os}}
+        go: ["1.22", "1.23", "1.24"]
     steps:
-    - name: Set up Go
-      uses: actions/setup-go@v2
-      with:
-        go-version: ${{matrix.go-version}}
-    - name: Checkout
-      uses: actions/checkout@v2
-    - name: gofmt
-      run: test -z "`gofmt -l .`"
-    - name: golint
-      run: test -z "`golint ./...`"
-    - name: go test
-      run: go test -v ./...
-    - name: Run example
-      run: cd example && go build -o http_breaker && ./http_breaker
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache: true
+
+      - name: Verify go.mod is tidy
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test (race + coverage)
+        run: go test -race -count=1 -coverprofile=coverage.out ./...
+
+      - name: Coverage report
+        run: go tool cover -func=coverage.out
+
+      - name: Upload coverage to Codecov
+        if: matrix.go == '1.24'
+        uses: codecov/codecov-action@v4
+        with:
+          files: ./coverage.out
+          fail_ci_if_error: false
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: true
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.11.4
+
+  examples:
+    name: Examples build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: true
+      - name: Build all examples
+        run: go build ./example/...
+
+  compat:
+    name: Backend compatibility (${{ matrix.backend }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - backend: redis
+            image: redis:7-alpine
+            options: --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 3s --health-retries 5
+          - backend: valkey
+            image: valkey/valkey:8-alpine
+            options: --health-cmd "valkey-cli ping" --health-interval 5s --health-timeout 3s --health-retries 5
+          - backend: keydb
+            image: eqalpha/keydb:latest
+            options: --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 3s --health-retries 5
+          - backend: dragonfly
+            image: docker.dragonflydb.io/dragonflydb/dragonfly:latest
+            # DragonflyDB needs an unlimited memlock ulimit and does not
+            # ship redis-cli, so we probe TCP via a shell health check.
+            options: --ulimit memlock=-1 --health-cmd "sh -c 'echo PING | nc -w1 localhost 6379 | grep -q PONG'" --health-interval 5s --health-timeout 3s --health-retries 10
+    services:
+      backend:
+        image: ${{ matrix.image }}
+        ports:
+          - 6379:6379
+        options: ${{ matrix.options }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: true
+      - name: Wait for ${{ matrix.backend }}
+        run: |
+          for i in {1..30}; do
+            if nc -z localhost 6379; then break; fi
+            sleep 1
+          done
+      - name: Run integration tests
+        run: go test -race -count=1 -tags=integration ./compat/...
+        env:
+          REDIS_ADDR: localhost:6379
+          BACKEND: ${{ matrix.backend }}

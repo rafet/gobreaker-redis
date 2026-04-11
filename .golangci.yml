@@ -1,0 +1,60 @@
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - misspell
+    - revive
+    - gocritic
+    - bodyclose
+    - copyloopvar
+    - errorlint
+    - nilerr
+    - prealloc
+    - unconvert
+    - usestdlibvars
+    - whitespace
+
+  settings:
+    errcheck:
+      check-blank: false
+      exclude-functions:
+        - (io.Closer).Close
+    revive:
+      rules:
+        - name: exported
+          severity: warning
+        - name: var-naming
+        - name: package-comments
+        - name: indent-error-flow
+        - name: error-return
+        - name: error-naming
+        - name: if-return
+        - name: blank-imports
+        - name: superfluous-else
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - performance
+        - style
+      disabled-checks:
+        - ifElseChain     # we use long switch-style if/else for clarity
+        - hugeParam       # Snapshot is intentionally a value type
+
+  exclusions:
+    rules:
+      # Test files frequently use shorter idioms.
+      - path: _test\.go
+        linters:
+          - errcheck
+          - gocritic
+          - revive
