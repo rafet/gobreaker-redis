@@ -69,14 +69,27 @@ type Store struct {
 	ownClient bool
 }
 
+// ErrNilClient is returned by New when the supplied UniversalClient is nil.
+// It is a configuration error: a nil client cannot satisfy the Store
+// contract because every operation requires a network round-trip.
+var ErrNilClient = errors.New("respstore: nil redis client")
+
 // New constructs a Store that talks to the given UniversalClient. The Store
 // does not take ownership of the client: the caller is responsible for
 // closing it.
 //
+// New panics if client is nil. This is intentional: a nil client is a
+// programming error caught at construction time, and there is no sensible
+// fallback. Callers that need to defer the connection decision should pass
+// a real client wrapped in a connection retry layer instead.
+//
 // The default key prefix is "gobreaker"; pass WithKeyPrefix to change it.
-// The default CAS retry budget is 10; pass WithMaxRetries to change it.
+// The default CAS retry budget is 100; pass WithMaxRetries to change it.
 // The default key TTL is zero (no expiry); pass WithTTL to enable it.
 func New(client redis.UniversalClient, opts ...Option) *Store {
+	if client == nil {
+		panic(ErrNilClient)
+	}
 	s := &Store{
 		client: client,
 		prefix: "gobreaker",

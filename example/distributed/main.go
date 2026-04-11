@@ -11,7 +11,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"os"
 	"time"
 
@@ -22,6 +21,13 @@ import (
 )
 
 func main() {
+	if err := run(); err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
 	addr := os.Getenv("REDIS_ADDR")
 	if addr == "" {
 		addr = "localhost:6379"
@@ -32,8 +38,8 @@ func main() {
 	store := respstore.New(client, respstore.WithKeyPrefix("dist-demo"))
 	ctx := context.Background()
 
-	makeBreaker := func(label string) *gobreaker.CircuitBreaker[string] {
-		cb, err := gobreaker.New[string](ctx, gobreaker.Settings{
+	makeBreaker := func(label string) (*gobreaker.CircuitBreaker[string], error) {
+		return gobreaker.New[string](ctx, gobreaker.Settings{
 			Name:        "shared-service",
 			Store:       store,
 			Timeout:     10 * time.Second,
@@ -43,31 +49,53 @@ func main() {
 					label, name, from, to, c.ConsecutiveFailures)
 			},
 		})
-		if err != nil {
-			log.Fatal(err)
-		}
-		return cb
 	}
 
-	replicaA := makeBreaker("replica-A")
-	replicaB := makeBreaker("replica-B")
+	replicaA, err := makeBreaker("replica-A")
+	if err != nil {
+		return fmt.Errorf("replica-A init: %w", err)
+	}
+	replicaB, err := makeBreaker("replica-B")
+	if err != nil {
+		return fmt.Errorf("replica-B init: %w", err)
+	}
 
-	// Replica A sees three failures and trips the shared breaker.
+	// Replica A sees three failures and trips the shared breaker. We
+	// expect each Execute call to return errBlip until the breaker
+	// trips, after which it returns ErrOpenState. Anything else is a
+	// real failure (e.g. the store is unreachable) and should abort
+	// the demo.
+	errBlip := errors.New("upstream blip")
 	for i := 0; i < 3; i++ {
-		_, _ = replicaA.Execute(ctx, func(ctx context.Context) (string, error) {
-			return "", errors.New("upstream blip")
+		_, err := replicaA.Execute(ctx, func(_ context.Context) (string, error) {
+			return "", errBlip
 		})
+		if err != nil && !errors.Is(err, errBlip) && !errors.Is(err, gobreaker.ErrOpenState) {
+			return fmt.Errorf("replica-A execute (iter %d): %w", i, err)
+		}
 	}
 
 	// Replica B observes the open state without producing any failures.
-	state, _ := replicaB.State(ctx)
+	state, err := replicaB.State(ctx)
+	if err != nil {
+		return fmt.Errorf("replica-B state read: %w", err)
+	}
 	fmt.Printf("\nreplica-B observes: %s\n", state)
 
 	// And replica B's next admission attempt is rejected.
-	_, err := replicaB.Execute(ctx, func(ctx context.Context) (string, error) {
-		return "should not run", nil
+	_, err = replicaB.Execute(ctx, func(_ context.Context) (string, error) {
+		// We do not panic here because that would skip every
+		// deferred close. Instead we return a sentinel that the
+		// caller can match.
+		return "", errors.New("replica-B Execute body should not run while open")
 	})
-	if errors.Is(err, gobreaker.ErrOpenState) {
+	switch {
+	case errors.Is(err, gobreaker.ErrOpenState):
 		fmt.Println("replica-B correctly rejected the request")
+		return nil
+	case err != nil:
+		return fmt.Errorf("replica-B execute: %w", err)
+	default:
+		return errors.New("replica-B execute returned without error — breaker did not reject")
 	}
 }

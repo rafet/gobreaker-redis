@@ -81,10 +81,12 @@ func New[T any](ctx context.Context, settings Settings) (*CircuitBreaker[T], err
 		now:      time.Now,
 	}
 
-	// Materialize an initial snapshot if none exists. We do this through
-	// Update so that distributed stores serialize the initial write
-	// atomically across processes.
-	if _, err := store.Update(ctx, settings.Name, cb.initialize); err != nil {
+	// Materialize an initial snapshot if none exists. We route this
+	// through runUpdate (rather than store.Update directly) so that the
+	// configured OnStoreFailure policy applies during construction too —
+	// otherwise a transient backend outage would abort breaker creation
+	// even when FallbackToLocal is set.
+	if _, err := cb.runUpdate(ctx, cb.initialize); err != nil {
 		return nil, fmt.Errorf("gobreaker: initialize %q: %w", settings.Name, err)
 	}
 
@@ -287,7 +289,12 @@ func (cb *CircuitBreaker[T]) admit(ctx context.Context) (Snapshot, error) {
 	cb.fireStateChanges(stateChanges)
 
 	if !admitted {
-		return Snapshot{}, admitErr
+		// Return the snapshot we observed even on rejection so the
+		// caller (and the Observer) can see the real state that
+		// caused the rejection — typically StateOpen or StateHalfOpen.
+		// Returning the zero Snapshot here would surface a misleading
+		// "closed" state to OnRequest hooks.
+		return snap, admitErr
 	}
 	return snap, nil
 }
@@ -340,7 +347,15 @@ func (cb *CircuitBreaker[T]) report(ctx context.Context, generationAtAdmit uint6
 		return next, nil
 	})
 
-	cb.fireStateChanges(stateChanges)
+	// Only publish state changes if the underlying Update actually
+	// committed. Store implementations are allowed to invoke the closure
+	// (and therefore append to stateChanges) even on a path that
+	// ultimately returns an error — for example a CAS retry that exhausts
+	// its budget. Emitting OnStateChange on such a path would report
+	// transitions that were never persisted.
+	if storeErr == nil {
+		cb.fireStateChanges(stateChanges)
+	}
 	return storeErr
 }
 

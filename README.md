@@ -23,23 +23,42 @@ Requires Go 1.22+.
 ## Quick start
 
 ```go
+package main
+
 import (
     "context"
+    "log"
     "net/http"
     "time"
 
     gobreaker "github.com/rafet/gobreaker-redis/v2"
 )
 
-cb, err := gobreaker.New[*http.Response](ctx, gobreaker.Settings{
-    Name:    "user-service",
-    Timeout: 30 * time.Second,
-})
-if err != nil { /* ... */ }
+func main() {
+    ctx := context.Background()
 
-resp, err := cb.Execute(ctx, func(ctx context.Context) (*http.Response, error) {
-    return http.DefaultClient.Do(req.WithContext(ctx))
-})
+    cb, err := gobreaker.New[*http.Response](ctx, gobreaker.Settings{
+        Name:    "user-service",
+        Timeout: 30 * time.Second,
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.example.com/users/1", http.NoBody)
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    resp, err := cb.Execute(ctx, func(ctx context.Context) (*http.Response, error) {
+        return http.DefaultClient.Do(req.WithContext(ctx))
+    })
+    if err != nil {
+        log.Printf("call failed: %v", err)
+        return
+    }
+    defer resp.Body.Close()
+}
 ```
 
 This gives you a single-process breaker backed by an in-memory `LocalStore`. To turn it into a distributed breaker shared across replicas, swap one line:

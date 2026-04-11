@@ -136,23 +136,30 @@ func TestGroupDelete(t *testing.T) {
 	}
 }
 
-func TestGroupKeys(t *testing.T) {
+func TestGroupNames(t *testing.T) {
 	g := newTestGroup(t, Settings{Name: "g"})
 	for _, k := range []string{"a", "b", "c"} {
 		_, _ = g.Get(context.Background(), k)
 	}
-	keys := g.Keys()
-	if len(keys) != 3 {
-		t.Errorf("len(Keys) = %d, want 3", len(keys))
+	names := g.Names()
+	if len(names) != 3 {
+		t.Errorf("len(Names) = %d, want 3", len(names))
 	}
 	got := map[string]bool{}
-	for _, k := range keys {
-		got[k] = true
+	for _, n := range names {
+		got[n] = true
 	}
-	for _, k := range []string{"a", "b", "c"} {
-		if !got[k] {
-			t.Errorf("Keys missing %q", k)
+	// Names returns derived breaker names, not raw keys.
+	for _, want := range []string{"g:a", "g:b", "g:c"} {
+		if !got[want] {
+			t.Errorf("Names missing %q", want)
 		}
+	}
+
+	// Keys is a deprecated alias and must return the same set.
+	keys := g.Keys() //nolint:staticcheck // intentionally exercising the deprecated alias
+	if len(keys) != 3 {
+		t.Errorf("len(Keys) = %d, want 3", len(keys))
 	}
 }
 

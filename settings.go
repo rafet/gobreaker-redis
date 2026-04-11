@@ -171,6 +171,13 @@ func (s Settings) Validate() error {
 	if s.Timeout < 0 {
 		return fmt.Errorf("%w: Timeout must be non-negative", ErrInvalidSettings)
 	}
+	switch s.OnStoreFailure {
+	case FallbackToLocal, FailFast:
+		// known values
+	default:
+		return fmt.Errorf("%w: OnStoreFailure %d is not a known StoreFailurePolicy value",
+			ErrInvalidSettings, s.OnStoreFailure)
+	}
 	return nil
 }
 

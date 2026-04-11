@@ -70,19 +70,31 @@ func AsStatusError(err error) *StatusError {
 //	    return httpcb.Result(resp, err)
 //	})
 //
-// If err is non-nil, Result returns it unchanged: connection errors,
-// timeouts, and DNS failures bypass the status logic.
+// Result behaves as follows:
 //
-// If resp is non-nil, Result wraps the response in a StatusError that the
-// IsSuccessful presets can inspect. The response is also returned so the
-// caller can read its body or headers regardless of how the breaker
-// classifies it.
+//   - If err is non-nil (connection refused, DNS failure, timeout), it is
+//     returned unchanged. The breaker counts these as failures by default.
+//   - If resp.StatusCode is in the 2xx range, Result returns a nil error so
+//     callers can use the conventional `if err != nil` pattern without
+//     special-casing the success path.
+//   - For any other status code, Result wraps the response in a
+//     StatusError that the IsSuccessful presets (OnlyServerErrors,
+//     RetryableStatuses, StatusInRange) can inspect. The caller can still
+//     read the response body — *http.Response is returned regardless.
+//
+// This contract makes the package usable from outside cb.Execute too: a
+// caller can write `resp, err := httpcb.Result(http.Get(url))` and treat
+// non-2xx responses as errors using normal Go control flow, then choose
+// which of those errors should trip the breaker via IsSuccessful.
 func Result(resp *http.Response, err error) (*http.Response, error) {
 	if err != nil {
 		return resp, err
 	}
 	if resp == nil {
 		return nil, errors.New("httpcb: nil response with nil error")
+	}
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return resp, nil
 	}
 	return resp, &StatusError{StatusCode: resp.StatusCode, Status: resp.Status}
 }

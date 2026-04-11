@@ -96,7 +96,7 @@ type Counts struct {
 Or, equivalently:
 
 ```go
-+ ReadyToOpen: func(c gobreaker.Counts) bool { return c.ConsecutiveFailures >= 5 }
+ReadyToOpen: func(c gobreaker.Counts) bool { return c.ConsecutiveFailures >= 5 }
 ```
 
 ## Error handling

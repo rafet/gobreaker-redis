@@ -52,12 +52,19 @@ func (cb *CircuitBreaker[T]) ExecuteWithFallback(
 // Use this when the fallback represents a "circuit-open contingency" rather
 // than a general failure handler — for example, returning a stale cached
 // value only because the breaker has decided the upstream is unhealthy.
+//
+// A nil fallback is treated as a no-op: the original error is propagated in
+// all cases. This makes OnOpenOnly safe to compose without defensive nil
+// checks at every call site.
 func OnOpenOnly[T any](fallback FallbackFunc[T]) FallbackFunc[T] {
 	return func(ctx context.Context, err error) (T, error) {
+		var zero T
+		if fallback == nil {
+			return zero, err
+		}
 		if errors.Is(err, ErrOpenState) || errors.Is(err, ErrTooManyRequests) {
 			return fallback(ctx, err)
 		}
-		var zero T
 		return zero, err
 	}
 }

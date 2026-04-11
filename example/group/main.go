@@ -40,25 +40,35 @@ func main() {
 	}
 
 	// Different tenants accumulate independent state.
+	errUpstream := errors.New("upstream error")
 	tenants := []string{"tenant-a", "tenant-b", "premium"}
 	for _, tenant := range tenants {
 		for i := 0; i < 4; i++ {
-			_, err := g.Execute(ctx, tenant, func(ctx context.Context) (string, error) {
-				return "", errors.New("upstream error")
+			_, err := g.Execute(ctx, tenant, func(_ context.Context) (string, error) {
+				return "", errUpstream
 			})
-			if errors.Is(err, gobreaker.ErrOpenState) {
+			switch {
+			case errors.Is(err, gobreaker.ErrOpenState):
 				fmt.Printf("%-10s call %d: REJECTED (open)\n", tenant, i+1)
-			} else {
+			case errors.Is(err, errUpstream):
 				fmt.Printf("%-10s call %d: failed\n", tenant, i+1)
+			case err != nil:
+				log.Fatalf("%s call %d: unexpected error: %v", tenant, i+1, err)
 			}
 		}
 	}
 
-	fmt.Printf("\nbreakers cached in memory: %d\nkeys: %v\n", g.Len(), g.Keys())
+	fmt.Printf("\nbreakers cached in memory: %d\nnames: %v\n", g.Len(), g.Names())
 
 	for _, tenant := range tenants {
-		cb, _ := g.Get(ctx, tenant)
-		state, _ := cb.State(ctx)
+		cb, err := g.Get(ctx, tenant)
+		if err != nil {
+			log.Fatalf("get breaker for %q: %v", tenant, err)
+		}
+		state, err := cb.State(ctx)
+		if err != nil {
+			log.Fatalf("state read for %q: %v", tenant, err)
+		}
 		fmt.Printf("%-10s -> %s\n", tenant, state)
 	}
 }
