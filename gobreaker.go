@@ -458,13 +458,31 @@ func (cb *CircuitBreaker[T]) reportFastInline(admittedGen uint64, callErr error)
 		snap.Counts.onExclusion()
 	case cb.settings.IsSuccessful(callErr):
 		snap.Counts.onSuccess()
-		if snap.State == StateHalfOpen && cb.settings.ReadyToClose(snap.Counts) {
-			ch2 = &stateChange{from: snap.State, to: StateClosed, counts: snap.Counts}
-			snap.State = StateClosed
-			snap.Generation++
-			snap.Counts.reset()
-			snap.GenerationStart = now
-			snap.Expiry = cb.closedExpiry(now)
+		switch snap.State {
+		case StateClosed:
+			// Evaluate ReadyToOpen even on success. This enables
+			// latency-aware predicates that trip on slow-but-successful
+			// requests (e.g. LatencyP99Above). Traditional failure-count
+			// predicates like ConsecutiveFailures(5) naturally return
+			// false here because ConsecutiveFailures == 0 after a
+			// success, so this is backward-compatible.
+			if cb.settings.ReadyToOpen(snap.Counts) {
+				ch2 = &stateChange{from: snap.State, to: StateOpen, counts: snap.Counts}
+				snap.State = StateOpen
+				snap.Generation++
+				snap.Counts.reset()
+				snap.GenerationStart = now
+				snap.Expiry = now.Add(cb.settings.Timeout)
+			}
+		case StateHalfOpen:
+			if cb.settings.ReadyToClose(snap.Counts) {
+				ch2 = &stateChange{from: snap.State, to: StateClosed, counts: snap.Counts}
+				snap.State = StateClosed
+				snap.Generation++
+				snap.Counts.reset()
+				snap.GenerationStart = now
+				snap.Expiry = cb.closedExpiry(now)
+			}
 		}
 	default:
 		snap.Counts.onFailure()
@@ -639,8 +657,15 @@ func (cb *CircuitBreaker[T]) report(ctx context.Context, generationAtAdmit uint6
 
 		case cb.settings.IsSuccessful(callErr):
 			next.Counts.onSuccess()
-			if next.State == StateHalfOpen && cb.settings.ReadyToClose(next.Counts) {
-				next = cb.transition(next, StateClosed, now, &stateChanges)
+			switch next.State {
+			case StateClosed:
+				if cb.settings.ReadyToOpen(next.Counts) {
+					next = cb.transition(next, StateOpen, now, &stateChanges)
+				}
+			case StateHalfOpen:
+				if cb.settings.ReadyToClose(next.Counts) {
+					next = cb.transition(next, StateClosed, now, &stateChanges)
+				}
 			}
 
 		default:

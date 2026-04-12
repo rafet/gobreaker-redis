@@ -272,6 +272,19 @@ func TestREG_Admit_HalfOpenRejectionPreservesState(t *testing.T) {
 		}
 	}
 
+	// Wait for the goroutine's OnRequest(admitted) to fire. The
+	// observer event is emitted AFTER the lock release, so
+	// InFlights==1 does not guarantee it has been recorded yet.
+	for {
+		obs.mu.Lock()
+		n := len(obs.requests)
+		obs.mu.Unlock()
+		if n > 0 {
+			break
+		}
+		runtime.Gosched()
+	}
+
 	// Reset observation.
 	obs.mu.Lock()
 	obs.requests = nil
@@ -287,11 +300,19 @@ func TestREG_Admit_HalfOpenRejectionPreservesState(t *testing.T) {
 	}
 
 	reqs, _, _ := obs.snapshot()
-	if len(reqs) != 1 {
-		t.Fatalf("requests = %d, want 1", len(reqs))
+	// Find the rejected request and assert it has the correct state.
+	// We search rather than assert len==1 because goroutine scheduling
+	// under fuzz or stress modes can interleave the first probe's
+	// OnRequest(admitted) with our observer reset.
+	var found bool
+	for _, r := range reqs {
+		if !r.admitted && r.state == StateHalfOpen {
+			found = true
+			break
+		}
 	}
-	if reqs[0].state != StateHalfOpen {
-		t.Errorf("rejection state = %v, want StateHalfOpen", reqs[0].state)
+	if !found {
+		t.Fatalf("no rejected request with StateHalfOpen found in %d requests: %+v", len(reqs), reqs)
 	}
 
 	close(gate)
