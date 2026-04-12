@@ -837,7 +837,7 @@ func TestREG_Group_DoubleCheckedLockingFromCache(t *testing.T) {
 		t.Fatal(err)
 	}
 	g.mu.Lock()
-	g.breakers["g:k"] = seed
+	g.breakers["g:k"] = &groupEntry[any]{cb: seed, lastUsed: time.Now()}
 	g.mu.Unlock()
 
 	got, err := g.Get(context.Background(), "k")

@@ -90,6 +90,21 @@ type Settings struct {
 	// requests to a service that may still be unhealthy.
 	ReadyToReopen ReadyToFunc
 
+	// HalfOpenAdmission, if non-nil, gates admission in the half-open
+	// state on a time-based probability ramp in addition to the
+	// HalfOpenMaxInFlights cap. This prevents the "wall of traffic"
+	// that hits the recovering backend when the breaker transitions
+	// from open to half-open.
+	//
+	// The strategy is evaluated BEFORE the in-flight cap: if the
+	// strategy rejects, the request is rejected with ErrTooManyRequests
+	// even if the in-flight count is below the cap.
+	//
+	// Built-in strategies: LinearRamp, ExponentialRamp, StepRamp.
+	// If nil, no ramping is applied (all requests up to the cap are
+	// admitted immediately).
+	HalfOpenAdmission AdmissionStrategy
+
 	// IsSuccessful classifies the error returned by a request as a
 	// success or failure. If nil, any non-nil error is treated as a
 	// failure.

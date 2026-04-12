@@ -298,6 +298,10 @@ func (cb *CircuitBreaker[T]) executeFast(ctx context.Context, req func(ctx conte
 		now = cb.localStore.now()
 	}
 
+	// Snapshot settings-dependent flags under the lock so concurrent
+	// UpdateSettings calls cannot race with our reads.
+	settings := cb.settings
+
 	snap := &cb.inlineSnap
 
 	// Apply time-based transitions before deciding admission.
@@ -326,8 +330,13 @@ func (cb *CircuitBreaker[T]) executeFast(ctx context.Context, req func(ctx conte
 	case StateOpen:
 		admitErr = ErrOpenState
 	case StateHalfOpen:
-		if snap.Counts.InFlights >= cb.settings.HalfOpenMaxInFlights {
+		if snap.Counts.InFlights >= settings.HalfOpenMaxInFlights {
 			admitErr = ErrTooManyRequests
+		} else if settings.HalfOpenAdmission != nil {
+			elapsed := now.Sub(snap.GenerationStart)
+			if !settings.HalfOpenAdmission.Admit(elapsed) {
+				admitErr = ErrTooManyRequests
+			}
 		}
 	}
 	if admitErr != nil {
@@ -335,11 +344,11 @@ func (cb *CircuitBreaker[T]) executeFast(ctx context.Context, req func(ctx conte
 		stateAtReject := snap.State
 		cb.syncToLocalStoreLocked()
 		cb.inlineMu.Unlock()
-		if admitChange != nil && (cb.settings.OnStateChange != nil || cb.settings.Observer != nil) {
+		if admitChange != nil && (settings.OnStateChange != nil || settings.Observer != nil) {
 			cb.fireStateChangesSlice(admitChange)
 		}
-		if cb.settings.Observer != nil {
-			cb.settings.Observer.OnRequest(cb.settings.Name, false, stateAtReject)
+		if settings.Observer != nil {
+			settings.Observer.OnRequest(settings.Name, false, stateAtReject)
 		}
 		return zero, admitErr
 	}
@@ -350,11 +359,11 @@ func (cb *CircuitBreaker[T]) executeFast(ctx context.Context, req func(ctx conte
 	snap.Version++
 	cb.inlineMu.Unlock()
 
-	if admitChange != nil && (cb.settings.OnStateChange != nil || cb.settings.Observer != nil) {
+	if admitChange != nil && (settings.OnStateChange != nil || settings.Observer != nil) {
 		cb.fireStateChangesSlice(admitChange)
 	}
-	if cb.settings.Observer != nil {
-		cb.settings.Observer.OnRequest(cb.settings.Name, true, admittedState)
+	if settings.Observer != nil {
+		settings.Observer.OnRequest(settings.Name, true, admittedState)
 	}
 
 	// ============ run the request ============
@@ -369,7 +378,7 @@ func (cb *CircuitBreaker[T]) executeFast(ctx context.Context, req func(ctx conte
 	// off the hot path because time.Now()/runtime.walltime dominates
 	// the wall-clock cost on most platforms.
 	var start time.Time
-	hasObserver := cb.settings.Observer != nil
+	hasObserver := settings.Observer != nil
 	if hasObserver {
 		start = cb.now()
 	}
@@ -390,13 +399,13 @@ func (cb *CircuitBreaker[T]) executeFast(ctx context.Context, req func(ctx conte
 		// failure inline and re-raise.
 		cb.reportFastInline(admittedGen, fmt.Errorf("gobreaker: request panicked: %v", panicVal))
 		if hasObserver {
-			cb.settings.Observer.OnOutcome(cb.settings.Name, OutcomeFailure, latency)
+			settings.Observer.OnOutcome(settings.Name, OutcomeFailure, latency)
 		}
 		panic(panicVal)
 	}
 
 	if hasObserver {
-		cb.settings.Observer.OnOutcome(cb.settings.Name, classifyOutcome(cb.settings, callErr), latency)
+		settings.Observer.OnOutcome(settings.Name, classifyOutcome(settings, callErr), latency)
 	}
 
 	cb.reportFastInline(admittedGen, callErr)
@@ -416,6 +425,9 @@ func (cb *CircuitBreaker[T]) reportFastInline(admittedGen uint64, callErr error)
 	if cb.localStore.now != nil {
 		now = cb.localStore.now()
 	}
+
+	// Capture settings under lock so concurrent UpdateSettings cannot race.
+	settings := cb.settings
 
 	snap := &cb.inlineSnap
 
@@ -454,9 +466,9 @@ func (cb *CircuitBreaker[T]) reportFastInline(admittedGen uint64, callErr error)
 
 	var ch2 *stateChange
 	switch {
-	case cb.settings.IsExcluded(callErr):
+	case settings.IsExcluded(callErr):
 		snap.Counts.onExclusion()
-	case cb.settings.IsSuccessful(callErr):
+	case settings.IsSuccessful(callErr):
 		snap.Counts.onSuccess()
 		switch snap.State {
 		case StateClosed:
@@ -466,16 +478,16 @@ func (cb *CircuitBreaker[T]) reportFastInline(admittedGen uint64, callErr error)
 			// predicates like ConsecutiveFailures(5) naturally return
 			// false here because ConsecutiveFailures == 0 after a
 			// success, so this is backward-compatible.
-			if cb.settings.ReadyToOpen(snap.Counts) {
+			if settings.ReadyToOpen(snap.Counts) {
 				ch2 = &stateChange{from: snap.State, to: StateOpen, counts: snap.Counts}
 				snap.State = StateOpen
 				snap.Generation++
 				snap.Counts.reset()
 				snap.GenerationStart = now
-				snap.Expiry = now.Add(cb.settings.Timeout)
+				snap.Expiry = now.Add(settings.Timeout)
 			}
 		case StateHalfOpen:
-			if cb.settings.ReadyToClose(snap.Counts) {
+			if settings.ReadyToClose(snap.Counts) {
 				ch2 = &stateChange{from: snap.State, to: StateClosed, counts: snap.Counts}
 				snap.State = StateClosed
 				snap.Generation++
@@ -488,22 +500,22 @@ func (cb *CircuitBreaker[T]) reportFastInline(admittedGen uint64, callErr error)
 		snap.Counts.onFailure()
 		switch snap.State {
 		case StateClosed:
-			if cb.settings.ReadyToOpen(snap.Counts) {
+			if settings.ReadyToOpen(snap.Counts) {
 				ch2 = &stateChange{from: snap.State, to: StateOpen, counts: snap.Counts}
 				snap.State = StateOpen
 				snap.Generation++
 				snap.Counts.reset()
 				snap.GenerationStart = now
-				snap.Expiry = now.Add(cb.settings.Timeout)
+				snap.Expiry = now.Add(settings.Timeout)
 			}
 		case StateHalfOpen:
-			if cb.settings.ReadyToReopen(snap.Counts) {
+			if settings.ReadyToReopen(snap.Counts) {
 				ch2 = &stateChange{from: snap.State, to: StateOpen, counts: snap.Counts}
 				snap.State = StateOpen
 				snap.Generation++
 				snap.Counts.reset()
 				snap.GenerationStart = now
-				snap.Expiry = now.Add(cb.settings.Timeout)
+				snap.Expiry = now.Add(settings.Timeout)
 			}
 		}
 	}
@@ -602,6 +614,13 @@ func (cb *CircuitBreaker[T]) admit(ctx context.Context) (Snapshot, error) {
 			if next.Counts.InFlights >= cb.settings.HalfOpenMaxInFlights {
 				admitErr = ErrTooManyRequests
 				return next, nil
+			}
+			if cb.settings.HalfOpenAdmission != nil {
+				elapsed := now.Sub(next.GenerationStart)
+				if !cb.settings.HalfOpenAdmission.Admit(elapsed) {
+					admitErr = ErrTooManyRequests
+					return next, nil
+				}
 			}
 
 		case StateClosed:

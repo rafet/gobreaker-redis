@@ -215,3 +215,97 @@ func TestGroupShareSnapshotAcrossKeys(t *testing.T) {
 		t.Errorf("cbB state = %v, want closed (independent breakers should not bleed)", stateB)
 	}
 }
+
+func TestGroup_MaxIdle_Reap(t *testing.T) {
+	g, err := NewGroup[any](context.Background(), GroupSettings{
+		Settings: Settings{Name: "idle"},
+		MaxIdle:  50 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, k := range []string{"a", "b", "c"} {
+		if _, err := g.Get(context.Background(), k); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if g.Len() != 3 {
+		t.Fatalf("Len = %d, want 3", g.Len())
+	}
+
+	// Wait for entries to become idle.
+	time.Sleep(80 * time.Millisecond)
+
+	n := g.Reap()
+	if n != 3 {
+		t.Errorf("Reap evicted %d, want 3", n)
+	}
+	if g.Len() != 0 {
+		t.Errorf("Len after Reap = %d, want 0", g.Len())
+	}
+}
+
+func TestGroup_MaxSize_EvictsOldest(t *testing.T) {
+	g, err := NewGroup[any](context.Background(), GroupSettings{
+		Settings: Settings{Name: "sz"},
+		MaxSize:  2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Create entries with slight time separation so ordering is deterministic.
+	for _, k := range []string{"a", "b"} {
+		if _, err := g.Get(context.Background(), k); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if g.Len() != 2 {
+		t.Fatalf("Len = %d, want 2", g.Len())
+	}
+
+	// Adding a third key should evict the oldest ("a").
+	if _, err := g.Get(context.Background(), "c"); err != nil {
+		t.Fatal(err)
+	}
+	if g.Len() != 2 {
+		t.Errorf("Len = %d, want 2 (oldest should have been evicted)", g.Len())
+	}
+
+	names := map[string]bool{}
+	for _, n := range g.Names() {
+		names[n] = true
+	}
+	if names["sz:a"] {
+		t.Error("oldest entry 'sz:a' was not evicted")
+	}
+	if !names["sz:b"] || !names["sz:c"] {
+		t.Errorf("expected sz:b and sz:c to remain, got %v", g.Names())
+	}
+}
+
+func TestGroup_Reap_NoEvictionIfFresh(t *testing.T) {
+	g, err := NewGroup[any](context.Background(), GroupSettings{
+		Settings: Settings{Name: "fresh"},
+		MaxIdle:  10 * time.Second, // very long idle threshold
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, k := range []string{"a", "b", "c"} {
+		if _, err := g.Get(context.Background(), k); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	n := g.Reap()
+	if n != 0 {
+		t.Errorf("Reap evicted %d, want 0 (entries are fresh)", n)
+	}
+	if g.Len() != 3 {
+		t.Errorf("Len = %d, want 3", g.Len())
+	}
+}

@@ -3,6 +3,7 @@ package gobreaker
 import (
 	"context"
 	"sync"
+	"time"
 )
 
 // GroupSettings configures a Group of CircuitBreakers that share a single
@@ -53,6 +54,17 @@ type GroupSettings struct {
 	// different ReadyToOpen thresholds, IsExcluded rules, or fallbacks
 	// without losing the shared Store and KeyToName conventions.
 	PerKeySettings func(key string, base Settings) Settings
+
+	// MaxIdle is the maximum duration a cached breaker can remain unused
+	// before it becomes eligible for eviction by Reap. A zero value
+	// means entries never expire based on idle time.
+	MaxIdle time.Duration
+
+	// MaxSize is the maximum number of breakers cached in the Group. When
+	// a new breaker is created and the cache exceeds MaxSize, the oldest
+	// (least-recently-used) entry is evicted lazily. A zero value means
+	// the cache is unbounded.
+	MaxSize int
 }
 
 // Group manages a collection of CircuitBreakers keyed by an opaque string,
@@ -63,9 +75,17 @@ type Group[T any] struct {
 	template       Settings
 	keyToName      func(string) string
 	perKeyOverride func(key string, base Settings) Settings
+	maxIdle        time.Duration
+	maxSize        int
 
 	mu       sync.RWMutex
-	breakers map[string]*CircuitBreaker[T]
+	breakers map[string]*groupEntry[T]
+}
+
+// groupEntry wraps a CircuitBreaker with metadata for eviction.
+type groupEntry[T any] struct {
+	cb       *CircuitBreaker[T]
+	lastUsed time.Time
 }
 
 // NewGroup constructs a Group from the given GroupSettings. The Settings
@@ -89,7 +109,9 @@ func NewGroup[T any](ctx context.Context, gs GroupSettings) (*Group[T], error) {
 		template:       gs.Settings,
 		keyToName:      gs.KeyToName,
 		perKeyOverride: gs.PerKeySettings,
-		breakers:       make(map[string]*CircuitBreaker[T]),
+		maxIdle:        gs.MaxIdle,
+		maxSize:        gs.MaxSize,
+		breakers:       make(map[string]*groupEntry[T]),
 	}
 	if g.keyToName == nil {
 		g.keyToName = g.defaultKeyToName
@@ -126,10 +148,14 @@ func (g *Group[T]) Get(ctx context.Context, key string) (*CircuitBreaker[T], err
 	name := g.keyToName(key)
 
 	g.mu.RLock()
-	cb, ok := g.breakers[name]
+	entry, ok := g.breakers[name]
 	g.mu.RUnlock()
 	if ok {
-		return cb, nil
+		// Hot path: update last-used time under write lock.
+		g.mu.Lock()
+		entry.lastUsed = time.Now()
+		g.mu.Unlock()
+		return entry.cb, nil
 	}
 
 	g.mu.Lock()
@@ -152,8 +178,9 @@ func (g *Group[T]) Get(ctx context.Context, key string) (*CircuitBreaker[T], err
 	// lock blocks readers in sync.RWMutex). The branch is correct
 	// and load-bearing nonetheless. See CONTRIBUTING.md for the
 	// coverage policy.
-	if cb, ok := g.breakers[name]; ok {
-		return cb, nil
+	if entry, ok := g.breakers[name]; ok {
+		entry.lastUsed = time.Now()
+		return entry.cb, nil
 	}
 
 	settings := g.template
@@ -169,8 +196,33 @@ func (g *Group[T]) Get(ctx context.Context, key string) (*CircuitBreaker[T], err
 	if err != nil {
 		return nil, err
 	}
-	g.breakers[name] = cb
+	now := time.Now()
+	g.breakers[name] = &groupEntry[T]{cb: cb, lastUsed: now}
+
+	// Lazy eviction: if we exceeded MaxSize, evict the single oldest entry.
+	if g.maxSize > 0 && len(g.breakers) > g.maxSize {
+		g.evictOldestLocked()
+	}
+
 	return cb, nil
+}
+
+// evictOldestLocked removes the single least-recently-used entry from the
+// breakers map. Caller must hold g.mu for writing.
+func (g *Group[T]) evictOldestLocked() {
+	var oldestKey string
+	var oldestTime time.Time
+	first := true
+	for k, e := range g.breakers {
+		if first || e.lastUsed.Before(oldestTime) {
+			oldestKey = k
+			oldestTime = e.lastUsed
+			first = false
+		}
+	}
+	if !first {
+		delete(g.breakers, oldestKey)
+	}
 }
 
 // Execute is a shorthand for Get followed by CircuitBreaker.Execute. It
@@ -234,4 +286,39 @@ func (g *Group[T]) Names() []string {
 // Deprecated: use Names instead.
 func (g *Group[T]) Keys() []string {
 	return g.Names()
+}
+
+// Reap evicts cached breakers that are no longer needed and returns the
+// number of entries removed.
+//
+// When MaxIdle > 0, any entry whose lastUsed time is older than MaxIdle
+// is evicted. When MaxSize > 0, entries exceeding MaxSize are evicted
+// in least-recently-used order. Both checks are applied in sequence.
+//
+// Reap is safe to call from any goroutine. Callers may run it on a
+// timer (e.g. via time.Ticker) to bound memory growth.
+func (g *Group[T]) Reap() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	evicted := 0
+
+	// Phase 1: evict idle entries.
+	if g.maxIdle > 0 {
+		cutoff := time.Now().Add(-g.maxIdle)
+		for k, e := range g.breakers {
+			if e.lastUsed.Before(cutoff) {
+				delete(g.breakers, k)
+				evicted++
+			}
+		}
+	}
+
+	// Phase 2: evict oldest entries until at or below MaxSize.
+	for g.maxSize > 0 && len(g.breakers) > g.maxSize {
+		g.evictOldestLocked()
+		evicted++
+	}
+
+	return evicted
 }
