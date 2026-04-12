@@ -71,7 +71,7 @@ type CircuitBreaker[T any] struct {
 	// localFallback is a single-process LocalStore used when the primary
 	// store is unreachable and OnStoreFailure is FallbackToLocal. It is
 	// lazily populated; nil until first failure.
-	mu            sync.Mutex
+	mu            sync.RWMutex
 	localFallback *LocalStore
 
 	// now is the clock function. Overridable for tests via setClock.
@@ -215,25 +215,21 @@ func (cb *CircuitBreaker[T]) Execute(ctx context.Context, req func(ctx context.C
 func (cb *CircuitBreaker[T]) executeStore(ctx context.Context, req func(ctx context.Context) (T, error)) (T, error) {
 	var zero T
 
+	// Snapshot settings once for the entire call so concurrent
+	// UpdateSettings cannot race with our field reads.
+	settings := cb.loadSettings()
+
 	admittedSnap, err := cb.admit(ctx)
 	if err != nil {
-		// Admission was refused (or the store failed). Report the
-		// rejection to the observer if there is one. We pass the
-		// observed state where possible: admittedSnap.State is set
-		// when admit returned ErrOpenState/ErrTooManyRequests; for
-		// other errors it is the zero state, which the observer can
-		// interpret as "unknown".
-		if cb.settings.Observer != nil {
-			cb.settings.Observer.OnRequest(cb.settings.Name, false, admittedSnap.State)
+		if settings.Observer != nil {
+			settings.Observer.OnRequest(settings.Name, false, admittedSnap.State)
 		}
 		return zero, err
 	}
-	if cb.settings.Observer != nil {
-		cb.settings.Observer.OnRequest(cb.settings.Name, true, admittedSnap.State)
+	if settings.Observer != nil {
+		settings.Observer.OnRequest(settings.Name, true, admittedSnap.State)
 	}
 
-	// At this point the request is admitted. We must report an outcome no
-	// matter how req returns, including panics.
 	var (
 		result   T
 		callErr  error
@@ -250,16 +246,15 @@ func (cb *CircuitBreaker[T]) executeStore(ctx context.Context, req func(ctx cont
 	latency := cb.now().Sub(start)
 
 	if panicVal != nil {
-		// Treat the panic as a failure outcome before re-raising.
 		_ = cb.report(ctx, admittedSnap.Generation, fmt.Errorf("gobreaker: request panicked: %v", panicVal))
-		if cb.settings.Observer != nil {
-			cb.settings.Observer.OnOutcome(cb.settings.Name, OutcomeFailure, latency)
+		if settings.Observer != nil {
+			settings.Observer.OnOutcome(settings.Name, OutcomeFailure, latency)
 		}
 		panic(panicVal)
 	}
 
-	if cb.settings.Observer != nil {
-		cb.settings.Observer.OnOutcome(cb.settings.Name, classifyOutcome(cb.settings, callErr), latency)
+	if settings.Observer != nil {
+		settings.Observer.OnOutcome(settings.Name, classifyOutcome(settings, callErr), latency)
 	}
 
 	if err := cb.report(ctx, admittedSnap.Generation, callErr); err != nil {
@@ -345,7 +340,7 @@ func (cb *CircuitBreaker[T]) executeFast(ctx context.Context, req func(ctx conte
 		cb.syncToLocalStoreLocked()
 		cb.inlineMu.Unlock()
 		if admitChange != nil && (settings.OnStateChange != nil || settings.Observer != nil) {
-			cb.fireStateChangesSlice(admitChange)
+			cb.fireStateChangesSlice(settings, admitChange)
 		}
 		if settings.Observer != nil {
 			settings.Observer.OnRequest(settings.Name, false, stateAtReject)
@@ -360,7 +355,7 @@ func (cb *CircuitBreaker[T]) executeFast(ctx context.Context, req func(ctx conte
 	cb.inlineMu.Unlock()
 
 	if admitChange != nil && (settings.OnStateChange != nil || settings.Observer != nil) {
-		cb.fireStateChangesSlice(admitChange)
+		cb.fireStateChangesSlice(settings, admitChange)
 	}
 	if settings.Observer != nil {
 		settings.Observer.OnRequest(settings.Name, true, admittedState)
@@ -459,7 +454,7 @@ func (cb *CircuitBreaker[T]) reportFastInline(admittedGen uint64, callErr error)
 		cb.syncToLocalStoreLocked()
 		cb.inlineMu.Unlock()
 		if ch1 != nil {
-			cb.fireStateChangesSlice(ch1)
+			cb.fireStateChangesSlice(settings, ch1)
 		}
 		return
 	}
@@ -524,10 +519,10 @@ func (cb *CircuitBreaker[T]) reportFastInline(admittedGen uint64, callErr error)
 	cb.inlineMu.Unlock()
 
 	if ch1 != nil {
-		cb.fireStateChangesSlice(ch1)
+		cb.fireStateChangesSlice(settings, ch1)
 	}
 	if ch2 != nil {
-		cb.fireStateChangesSlice(ch2)
+		cb.fireStateChangesSlice(settings, ch2)
 	}
 }
 
@@ -553,12 +548,12 @@ func (cb *CircuitBreaker[T]) syncToLocalStoreLocked() {
 // without allocating a backing slice on the heap on the steady-state
 // success path (where no transition occurs and the function is never
 // called).
-func (cb *CircuitBreaker[T]) fireStateChangesSlice(ch *stateChange) {
-	if cb.settings.OnStateChange != nil {
-		cb.settings.OnStateChange(cb.settings.Name, ch.from, ch.to, ch.counts)
+func (cb *CircuitBreaker[T]) fireStateChangesSlice(s Settings, ch *stateChange) {
+	if s.OnStateChange != nil {
+		s.OnStateChange(s.Name, ch.from, ch.to, ch.counts)
 	}
-	if cb.settings.Observer != nil {
-		cb.settings.Observer.OnStateChange(cb.settings.Name, ch.from, ch.to, ch.counts)
+	if s.Observer != nil {
+		s.Observer.OnStateChange(s.Name, ch.from, ch.to, ch.counts)
 	}
 }
 
@@ -794,12 +789,18 @@ func (cb *CircuitBreaker[T]) fireStateChanges(changes []stateChange) {
 	if len(changes) == 0 {
 		return
 	}
+	// Read settings once for all changes. This is called from the
+	// generic (non-fast) executeStore path where settings is not
+	// captured in advance. The read here is outside any lock but
+	// Settings is a value type, so the read is a consistent snapshot
+	// of the struct at this instant.
+	s := cb.settings
 	for _, ch := range changes {
-		if cb.settings.OnStateChange != nil {
-			cb.settings.OnStateChange(cb.settings.Name, ch.from, ch.to, ch.counts)
+		if s.OnStateChange != nil {
+			s.OnStateChange(s.Name, ch.from, ch.to, ch.counts)
 		}
-		if cb.settings.Observer != nil {
-			cb.settings.Observer.OnStateChange(cb.settings.Name, ch.from, ch.to, ch.counts)
+		if s.Observer != nil {
+			s.Observer.OnStateChange(s.Name, ch.from, ch.to, ch.counts)
 		}
 	}
 }
@@ -838,6 +839,17 @@ func (cb *CircuitBreaker[T]) localFallbackStore() *LocalStore {
 		cb.localFallback = NewLocalStore()
 	}
 	return cb.localFallback
+}
+
+// loadSettings returns a race-free copy of the breaker's Settings.
+// On the fast path (localStore != nil), settings are captured under
+// inlineMu at the start of each call, so this helper is only needed
+// by the generic executeStore / admit / report code paths.
+func (cb *CircuitBreaker[T]) loadSettings() Settings {
+	cb.mu.RLock()
+	s := cb.settings
+	cb.mu.RUnlock()
+	return s
 }
 
 // setClock replaces the breaker's clock function. Tests use it directly via

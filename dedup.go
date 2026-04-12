@@ -60,12 +60,18 @@ func (d *Deduplicator[T]) ExecuteDedup(ctx context.Context, key string, req func
 	d.in[key] = c
 	d.mu.Unlock()
 
-	c.val, c.err = d.cb.Execute(ctx, req)
-	c.wg.Done()
+	// Panic safety: if Execute re-raises a panic from the wrapped
+	// function, wg.Done() and the key cleanup MUST still run.
+	// Without this defer, a panic would deadlock every goroutine
+	// waiting on c.wg.Wait() and permanently lock the key.
+	defer func() {
+		c.wg.Done()
+		d.mu.Lock()
+		delete(d.in, key)
+		d.mu.Unlock()
+	}()
 
-	d.mu.Lock()
-	delete(d.in, key)
-	d.mu.Unlock()
+	c.val, c.err = d.cb.Execute(ctx, req)
 
 	return c.val, c.err
 }

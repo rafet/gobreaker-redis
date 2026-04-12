@@ -19,18 +19,7 @@ func (cb *CircuitBreaker[T]) ForceOpen(ctx context.Context) error {
 	if cb.localStore != nil {
 		return cb.forceStateFast(StateOpen)
 	}
-	_, err := cb.runUpdate(ctx, func(current Snapshot, now time.Time) (Snapshot, error) {
-		if current.State == StateOpen {
-			return current, nil
-		}
-		current.State = StateOpen
-		current.Generation++
-		current.Counts.reset()
-		current.GenerationStart = now
-		current.Expiry = now.Add(cb.settings.Timeout)
-		return current, nil
-	})
-	return err
+	return cb.forceStateStore(ctx, StateOpen)
 }
 
 // ForceClosed forces the breaker into the closed state. The breaker
@@ -44,18 +33,7 @@ func (cb *CircuitBreaker[T]) ForceClosed(ctx context.Context) error {
 	if cb.localStore != nil {
 		return cb.forceStateFast(StateClosed)
 	}
-	_, err := cb.runUpdate(ctx, func(current Snapshot, now time.Time) (Snapshot, error) {
-		if current.State == StateClosed {
-			return current, nil
-		}
-		current.State = StateClosed
-		current.Generation++
-		current.Counts.reset()
-		current.GenerationStart = now
-		current.Expiry = cb.closedExpiry(now)
-		return current, nil
-	})
-	return err
+	return cb.forceStateStore(ctx, StateClosed)
 }
 
 // Reset zeroes all Counts and returns the breaker to the closed state
@@ -69,15 +47,62 @@ func (cb *CircuitBreaker[T]) Reset(ctx context.Context) error {
 	if cb.localStore != nil {
 		return cb.forceStateFast(StateClosed)
 	}
-	_, err := cb.runUpdate(ctx, func(_ Snapshot, now time.Time) (Snapshot, error) {
-		return Snapshot{
-			State:           StateClosed,
-			Generation:      1,
-			GenerationStart: now,
-			Expiry:          cb.closedExpiry(now),
-		}, nil
+	return cb.forceStateStore(ctx, StateClosed)
+}
+
+// forceStateStore is the generic (non-fast) implementation of
+// ForceOpen/ForceClosed/Reset. It captures settings under the
+// breaker's mutex to avoid races with concurrent UpdateSettings,
+// then runs the state change through the Store, and fires the
+// OnStateChange callback afterward.
+func (cb *CircuitBreaker[T]) forceStateStore(ctx context.Context, target State) error {
+	// Capture settings race-free. The closure below runs under the
+	// Store's internal lock (different from cb.mu), so we must NOT
+	// read cb.settings inside the closure.
+	cb.mu.Lock()
+	settings := cb.settings
+	cb.mu.Unlock()
+
+	var change *stateChange
+
+	_, err := cb.runUpdate(ctx, func(current Snapshot, now time.Time) (Snapshot, error) {
+		change = nil // reset on retry
+		if current.State == target && target != StateClosed {
+			return current, nil
+		}
+		from := current.State
+		current.State = target
+		current.Generation++
+		current.Counts.reset()
+		current.GenerationStart = now
+		switch target {
+		case StateClosed:
+			current.Expiry = cb.closedExpiry(now)
+		case StateOpen:
+			current.Expiry = now.Add(settings.Timeout)
+		case StateHalfOpen:
+			current.Expiry = time.Time{}
+		}
+		if from != target {
+			change = &stateChange{from: from, to: target, counts: Counts{}}
+		}
+		return current, nil
 	})
-	return err
+	if err != nil {
+		return err
+	}
+
+	// Fire callback AFTER the Store update committed — matching the
+	// contract that callbacks never run while the breaker holds a lock.
+	if change != nil {
+		if settings.OnStateChange != nil {
+			settings.OnStateChange(settings.Name, change.from, change.to, change.counts)
+		}
+		if settings.Observer != nil {
+			settings.Observer.OnStateChange(settings.Name, change.from, change.to, change.counts)
+		}
+	}
+	return nil
 }
 
 // forceStateFast is the inlineSnap version of ForceOpen/ForceClosed/Reset.
@@ -87,10 +112,11 @@ func (cb *CircuitBreaker[T]) forceStateFast(target State) error {
 	if cb.localStore.now != nil {
 		now = cb.localStore.now()
 	}
+	// Capture settings under lock (same lock as UpdateSettings fast path).
+	settings := cb.settings
+
 	snap := &cb.inlineSnap
 	if snap.State == target && target != StateClosed {
-		// Already in the target state; nothing to do (except Reset
-		// which always resets even if already closed).
 		cb.inlineMu.Unlock()
 		return nil
 	}
@@ -103,16 +129,20 @@ func (cb *CircuitBreaker[T]) forceStateFast(target State) error {
 	case StateClosed:
 		snap.Expiry = cb.closedExpiry(now)
 	case StateOpen:
-		snap.Expiry = now.Add(cb.settings.Timeout)
+		snap.Expiry = now.Add(settings.Timeout)
 	case StateHalfOpen:
 		snap.Expiry = time.Time{}
 	}
 	snap.Version++
 	cb.inlineMu.Unlock()
 
-	if from != target && (cb.settings.OnStateChange != nil || cb.settings.Observer != nil) {
-		ch := &stateChange{from: from, to: target, counts: Counts{}}
-		cb.fireStateChangesSlice(ch)
+	if from != target {
+		if settings.OnStateChange != nil {
+			settings.OnStateChange(settings.Name, from, target, Counts{})
+		}
+		if settings.Observer != nil {
+			settings.Observer.OnStateChange(settings.Name, from, target, Counts{})
+		}
 	}
 	return nil
 }
