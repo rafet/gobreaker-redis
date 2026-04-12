@@ -140,6 +140,13 @@ func RetryableStatuses(codes ...int) func(error) bool {
 // StatusInRange returns an IsSuccessful function that treats any HTTP
 // status in the inclusive range [low, high] — plus connection errors — as
 // failures.
+//
+// Note: the `low > high` swap guard accepts misordered arguments
+// graciously. The `low > high` vs `low >= high` mutation is equivalent
+// at the boundary (low == high), so mutation testing reports it as
+// surviving — there is no test that can distinguish the two because
+// both produce the same outcome on the same input. This is a textbook
+// equivalent mutant.
 func StatusInRange(low, high int) func(error) bool {
 	if low > high {
 		low, high = high, low

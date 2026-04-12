@@ -128,8 +128,15 @@ func WithTTL(ttl time.Duration) Option {
 
 // WithMaxRetries bounds the number of CAS retries for a single Update call.
 // If the budget is exhausted, Update returns gobreaker.ErrSnapshotConflict.
-// The default is 10, which is enough to absorb routine contention without
+// The default is 100, which is enough to absorb routine contention without
 // becoming a livelock attractor.
+//
+// Note: the `n < 1` clamp guard rejects zero and negative inputs by
+// promoting them to 1. The `n < 1` vs `n <= 1` mutation is equivalent
+// at the boundary (n == 1), because both branches produce `n = 1` for
+// that input. Mutation testing reports it as surviving for that
+// reason — there is no test that can distinguish the two because the
+// observable behavior is identical.
 func WithMaxRetries(n int) Option {
 	if n < 1 {
 		n = 1

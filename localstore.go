@@ -89,3 +89,4 @@ func (s *LocalStore) setClock(now func() time.Time) {
 	defer s.mu.Unlock()
 	s.now = now
 }
+

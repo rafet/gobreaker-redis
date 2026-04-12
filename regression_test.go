@@ -973,6 +973,52 @@ func TestREG_Execute_PanicWithObserverObservesFailure(t *testing.T) {
 	}
 }
 
+// MUT_Generation_IncrementsOnTransition kills the mutation
+// `snap.Generation++` → `snap.Generation--` at gobreaker.go:407:17.
+// The mutation survived because no test asserted that the generation
+// monotonically increases across a state transition.
+func TestMUT_Generation_IncrementsOnTransition(t *testing.T) {
+	cb := &CircuitBreaker[any]{
+		settings: Settings{Name: "x"}.defaults(),
+	}
+	var changes []stateChange
+	in := Snapshot{State: StateClosed, Generation: 5}
+	out := cb.transition(in, StateOpen, time.Now(), &changes)
+	if out.Generation != 6 {
+		t.Errorf("transition closed->open: Generation = %d, want 6 (%d+1)", out.Generation, in.Generation)
+	}
+}
+
+// MUT_Generation_IncrementsOnClosedRollover kills the same mutation
+// at gobreaker.go:385:19, this time inside advanceTime's closed-state
+// interval rollover. A rollover keeps State == Closed but rotates
+// Generation, which is the only way the breaker can drop stale
+// per-generation Counts.
+func TestMUT_Generation_IncrementsOnClosedRollover(t *testing.T) {
+	cb := &CircuitBreaker[any]{
+		settings: Settings{Name: "x", Interval: time.Second}.defaults(),
+	}
+	now := time.Date(2030, 1, 1, 0, 0, 10, 0, time.UTC)
+	var changes []stateChange
+	in := Snapshot{
+		State:           StateClosed,
+		Generation:      7,
+		GenerationStart: now.Add(-2 * time.Second),
+		Expiry:          now.Add(-time.Second),
+		Counts:          Counts{Requests: 100, TotalSuccesses: 100},
+	}
+	out := cb.advanceTime(in, now, &changes)
+	if out.Generation != 8 {
+		t.Errorf("rollover: Generation = %d, want 8 (%d+1)", out.Generation, in.Generation)
+	}
+	if out.Counts != (Counts{}) {
+		t.Errorf("rollover: Counts = %+v, want zeroed", out.Counts)
+	}
+	if len(changes) != 0 {
+		t.Errorf("rollover: %d state changes recorded; want 0 (no actual state change)", len(changes))
+	}
+}
+
 // REG_Group_PerKeyOverrideRunOnce verifies that PerKeySettings is
 // invoked exactly once per key (the first time it is seen), not on
 // every Get.

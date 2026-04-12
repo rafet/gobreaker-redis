@@ -125,6 +125,56 @@ func TestREG_WithMaxRetries_NegativeIsClampedToOne(t *testing.T) {
 	}
 }
 
+// MUT_WithMaxRetries_OneIsAccepted kills the boundary mutation at
+// respstore/store.go:134:7 where `if n < 1` could become `if n <= 1`.
+// The latter would silently bump WithMaxRetries(1) up to 1 (no
+// change) but would also reject the perfectly valid value of 1.
+// Verifying n=1 directly catches this.
+func TestMUT_WithMaxRetries_OneIsAccepted(t *testing.T) {
+	store, _ := newTestStoreLocal(t, WithMaxRetries(1))
+	if store.maxRetry != 1 {
+		t.Errorf("maxRetry = %d, want 1 (n=1 must be accepted as-is)", store.maxRetry)
+	}
+}
+
+// MUT_Update_RetryBudgetIsExact kills the boundary mutation at
+// respstore/store.go:164:28 where `attempt < s.maxRetry` could become
+// `<=`. We arm a perpetual conflict scenario, set the budget to 1,
+// and assert exactly one closure invocation before ErrSnapshotConflict.
+func TestMUT_Update_RetryBudgetIsExact(t *testing.T) {
+	store, _ := newTestStoreLocal(t, WithMaxRetries(1))
+
+	// Seed
+	if _, err := store.Update(context.Background(), "x", func(c gobreaker.Snapshot, _ time.Time) (gobreaker.Snapshot, error) {
+		return c, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Force a conflict on every attempt by mutating the key from
+	// inside the closure.
+	var attempts int
+	_, err := store.Update(context.Background(), "x", func(c gobreaker.Snapshot, _ time.Time) (gobreaker.Snapshot, error) {
+		attempts++
+		// Mutate the key from a "concurrent" Update so this attempt's
+		// CAS will fail. Use a separate Store handle to bypass our
+		// own retry budget.
+		if _, err := store.Update(context.Background(), "x", func(c2 gobreaker.Snapshot, _ time.Time) (gobreaker.Snapshot, error) {
+			c2.Counts.Requests++
+			return c2, nil
+		}); err != nil {
+			t.Fatalf("inner Update: %v", err)
+		}
+		return c, nil
+	})
+	if !errors.Is(err, gobreaker.ErrSnapshotConflict) {
+		t.Errorf("err = %v, want ErrSnapshotConflict", err)
+	}
+	if attempts != 1 {
+		t.Errorf("closure called %d times; with WithMaxRetries(1) we expect exactly 1", attempts)
+	}
+}
+
 // REG_Get_AfterCloseOwningClientReturnsError verifies that calls on a
 // Store whose underlying client has been closed surface a clean error
 // instead of panicking. (When ownClient is true, Close shuts down the

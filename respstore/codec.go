@@ -109,19 +109,30 @@ func decodeSnapshot(fields map[string]string) (gobreaker.Snapshot, error) {
 	return s, nil
 }
 
-// formatTime encodes a time.Time as nanoseconds since the Unix epoch. The
-// zero time is encoded as "0" so the Lua script can roundtrip it without
-// special-casing strings.
+// formatTime encodes a time.Time as nanoseconds since the Unix epoch.
+//
+// The Go zero time (time.Time{}, year 1) and the Unix epoch
+// (time.Unix(0, 0), year 1970) are SEMANTICALLY different but both
+// produce UnixNano() == 0. To preserve the distinction across the
+// codec boundary we encode them differently:
+//
+//   - time.Time{}        → ""   (empty string sentinel)
+//   - time.Unix(0, 0)    → "0"
+//   - any other moment t → strconv.FormatInt(t.UnixNano(), 10)
+//
+// Without the empty-string sentinel, a Snapshot whose Expiry is set
+// to the Unix epoch would round-trip to the Go zero time, which the
+// state machine treats as "no expiry" — the wrong answer.
 func formatTime(t time.Time) string {
 	if t.IsZero() {
-		return "0"
+		return ""
 	}
 	return strconv.FormatInt(t.UnixNano(), 10)
 }
 
 func parseTime(m map[string]string, field string) (time.Time, error) {
 	raw, ok := m[field]
-	if !ok || raw == "0" || raw == "" {
+	if !ok || raw == "" {
 		return time.Time{}, nil
 	}
 	n, err := strconv.ParseInt(raw, 10, 64)

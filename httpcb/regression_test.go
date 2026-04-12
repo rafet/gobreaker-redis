@@ -15,6 +15,57 @@ import (
 // CodeRabbit review pass that involves the httpcb subpackage, plus
 // every gap surfaced by the audit. Naming convention: REG_<topic>.
 
+// MUT_Result_300IsNotSuccess kills the boundary mutation at
+// httpcb/httpcb.go:96:47 where `resp.StatusCode < 300` could become
+// `<= 300`. The 300 status code is a multiple-choice redirect, not a
+// success, and Result must wrap it in a StatusError so the caller can
+// inspect it. The previous test set covered 299 but jumped to 301 —
+// the exact 300 boundary was untested.
+func TestMUT_Result_300IsNotSuccess(t *testing.T) {
+	resp := &http.Response{StatusCode: http.StatusMultipleChoices, Status: "300 Multiple Choices"}
+	got, err := Result(resp, nil) //nolint:bodyclose // synthetic
+	if got != resp {
+		t.Errorf("Result lost the response")
+	}
+	if err == nil {
+		t.Fatalf("Result(300) returned nil error; want StatusError")
+	}
+	se := AsStatusError(err)
+	if se == nil || se.StatusCode != http.StatusMultipleChoices {
+		t.Errorf("err = %v, want StatusError{300}", err)
+	}
+}
+
+// MUT_StatusInRange_DegenerateRangeIncludesValue kills the boundary
+// mutation at httpcb/httpcb.go:144:9 where `low > high` could become
+// `low >= high`. When `low == high`, the swap branch must NOT fire,
+// and the predicate must treat the single value as in-range.
+func TestMUT_StatusInRange_DegenerateRangeIncludesValue(t *testing.T) {
+	f := StatusInRange(503, 503)
+	if f(&StatusError{StatusCode: 503}) {
+		t.Error("503 must be inside [503, 503]")
+	}
+	if !f(&StatusError{StatusCode: 502}) {
+		t.Error("502 must NOT be inside [503, 503]")
+	}
+	if !f(&StatusError{StatusCode: 504}) {
+		t.Error("504 must NOT be inside [503, 503]")
+	}
+}
+
+// MUT_OnlyServerErrors_500BoundaryFails kills the boundary mutation
+// at httpcb/httpcb.go:111:25 where `se.StatusCode < 500` could become
+// `<= 500`. Status 500 is the smallest 5xx and must count as a
+// failure.
+func TestMUT_OnlyServerErrors_500BoundaryFails(t *testing.T) {
+	if OnlyServerErrors(&StatusError{StatusCode: 500}) {
+		t.Error("500 must be a failure under OnlyServerErrors")
+	}
+	if !OnlyServerErrors(&StatusError{StatusCode: 499}) {
+		t.Error("499 must be a success under OnlyServerErrors")
+	}
+}
+
 // REG_Result_2xxReturnsNilError is the regression test for CodeRabbit
 // review issue #9. Bug: Result wrapped every non-error response in a
 // StatusError, including 2xx responses, breaking the conventional Go

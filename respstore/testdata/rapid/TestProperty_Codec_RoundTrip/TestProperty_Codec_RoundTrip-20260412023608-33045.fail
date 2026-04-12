@@ -1,0 +1,43 @@
+# 2026/04/12 02:36:08.438481 [TestProperty_Codec_RoundTrip] [rapid] draw state: 0
+# 2026/04/12 02:36:08.438517 [TestProperty_Codec_RoundTrip] [rapid] draw gs: 0
+# 2026/04/12 02:36:08.438524 [TestProperty_Codec_RoundTrip] [rapid] draw ex: 0
+# 2026/04/12 02:36:08.438532 [TestProperty_Codec_RoundTrip] [rapid] draw gsZero: false
+# 2026/04/12 02:36:08.438537 [TestProperty_Codec_RoundTrip] [rapid] draw exZero: false
+# 2026/04/12 02:36:08.438545 [TestProperty_Codec_RoundTrip] [rapid] draw gen: 0x0
+# 2026/04/12 02:36:08.438550 [TestProperty_Codec_RoundTrip] [rapid] draw req: 0x0
+# 2026/04/12 02:36:08.438556 [TestProperty_Codec_RoundTrip] [rapid] draw inf: 0x0
+# 2026/04/12 02:36:08.438565 [TestProperty_Codec_RoundTrip] [rapid] draw succ: 0x0
+# 2026/04/12 02:36:08.438570 [TestProperty_Codec_RoundTrip] [rapid] draw fail: 0x0
+# 2026/04/12 02:36:08.438574 [TestProperty_Codec_RoundTrip] [rapid] draw excl: 0x0
+# 2026/04/12 02:36:08.438579 [TestProperty_Codec_RoundTrip] [rapid] draw csucc: 0x0
+# 2026/04/12 02:36:08.438583 [TestProperty_Codec_RoundTrip] [rapid] draw cfail: 0x0
+# 2026/04/12 02:36:08.438591 [TestProperty_Codec_RoundTrip] GenerationStart: 0001-01-01 00:00:00 +0000 UTC != 1970-01-01 02:00:00 +0200 EET
+# 
+v0.4.8#8096416774928743410
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
