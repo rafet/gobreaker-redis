@@ -134,7 +134,7 @@ func BenchmarkAdmit(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, _ = cb.admit(ctx)
+		_, _ = cb.admit(ctx, cb.settings)
 		// Reset in-flight: we are not exercising report() here so
 		// the in-flight counter would otherwise grow unbounded.
 		cb.store.Update(ctx, "bench-admit", func(c Snapshot, _ time.Time) (Snapshot, error) {

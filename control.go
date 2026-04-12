@@ -65,7 +65,7 @@ func (cb *CircuitBreaker[T]) forceStateStore(ctx context.Context, target State) 
 
 	var change *stateChange
 
-	_, err := cb.runUpdate(ctx, func(current Snapshot, now time.Time) (Snapshot, error) {
+	_, err := cb.runUpdateWith(ctx, settings, func(current Snapshot, now time.Time) (Snapshot, error) {
 		change = nil // reset on retry
 		if current.State == target && target != StateClosed {
 			return current, nil
@@ -77,7 +77,7 @@ func (cb *CircuitBreaker[T]) forceStateStore(ctx context.Context, target State) 
 		current.GenerationStart = now
 		switch target {
 		case StateClosed:
-			current.Expiry = cb.closedExpiry(now)
+			current.Expiry = closedExpiryFor(now, settings.Interval)
 		case StateOpen:
 			current.Expiry = now.Add(settings.Timeout)
 		case StateHalfOpen:

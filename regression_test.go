@@ -56,7 +56,7 @@ func TestREG_StateChange_NotEmittedOnFailedUpdate(t *testing.T) {
 	// snapshot (Generation=0), simulating an admitted-but-failing
 	// request that the closure would mark as a failure capable of
 	// tripping the breaker.
-	err := cb.report(context.Background(), 0, errors.New("upstream failure"))
+	err := cb.report(context.Background(), cb.settings, 0, errors.New("upstream failure"))
 	if err == nil {
 		t.Fatal("expected error from failing store, got nil")
 	}
@@ -104,7 +104,7 @@ func TestREG_StateChange_NotEmittedOnFailedAdmit(t *testing.T) {
 		Expiry:          time.Now().Add(-time.Minute),
 	}
 
-	if _, err := cb.admit(context.Background()); err == nil {
+	if _, err := cb.admit(context.Background(), cb.settings); err == nil {
 		t.Fatal("expected error from failing store, got nil")
 	}
 	if got := atomic.LoadInt64(&stateChanges); got != 0 {
@@ -495,7 +495,7 @@ func TestREG_Transition_NoOpForSameState(t *testing.T) {
 	}
 	var changes []stateChange
 	in := Snapshot{State: StateClosed, Generation: 5}
-	out := cb.transition(in, StateClosed, time.Now(), &changes)
+	out := transition(in, StateClosed, time.Now(), cb.settings, &changes)
 	if out != in {
 		t.Errorf("transition closed->closed mutated snapshot: %+v -> %+v", in, out)
 	}
@@ -1004,7 +1004,7 @@ func TestMUT_Generation_IncrementsOnTransition(t *testing.T) {
 	}
 	var changes []stateChange
 	in := Snapshot{State: StateClosed, Generation: 5}
-	out := cb.transition(in, StateOpen, time.Now(), &changes)
+	out := transition(in, StateOpen, time.Now(), cb.settings, &changes)
 	if out.Generation != 6 {
 		t.Errorf("transition closed->open: Generation = %d, want 6 (%d+1)", out.Generation, in.Generation)
 	}
@@ -1028,7 +1028,7 @@ func TestMUT_Generation_IncrementsOnClosedRollover(t *testing.T) {
 		Expiry:          now.Add(-time.Second),
 		Counts:          Counts{Requests: 100, TotalSuccesses: 100},
 	}
-	out := cb.advanceTime(in, now, &changes)
+	out := advanceTime(in, now, cb.settings, &changes)
 	if out.Generation != 8 {
 		t.Errorf("rollover: Generation = %d, want 8 (%d+1)", out.Generation, in.Generation)
 	}

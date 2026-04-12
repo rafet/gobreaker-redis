@@ -219,7 +219,7 @@ func (cb *CircuitBreaker[T]) executeStore(ctx context.Context, req func(ctx cont
 	// UpdateSettings cannot race with our field reads.
 	settings := cb.loadSettings()
 
-	admittedSnap, err := cb.admit(ctx)
+	admittedSnap, err := cb.admit(ctx, settings)
 	if err != nil {
 		if settings.Observer != nil {
 			settings.Observer.OnRequest(settings.Name, false, admittedSnap.State)
@@ -246,7 +246,7 @@ func (cb *CircuitBreaker[T]) executeStore(ctx context.Context, req func(ctx cont
 	latency := cb.now().Sub(start)
 
 	if panicVal != nil {
-		_ = cb.report(ctx, admittedSnap.Generation, fmt.Errorf("gobreaker: request panicked: %v", panicVal))
+		_ = cb.report(ctx, settings, admittedSnap.Generation, fmt.Errorf("gobreaker: request panicked: %v", panicVal))
 		if settings.Observer != nil {
 			settings.Observer.OnOutcome(settings.Name, OutcomeFailure, latency)
 		}
@@ -257,7 +257,7 @@ func (cb *CircuitBreaker[T]) executeStore(ctx context.Context, req func(ctx cont
 		settings.Observer.OnOutcome(settings.Name, classifyOutcome(settings, callErr), latency)
 	}
 
-	if err := cb.report(ctx, admittedSnap.Generation, callErr); err != nil {
+	if err := cb.report(ctx, settings, admittedSnap.Generation, callErr); err != nil {
 		// Reporting failed (e.g. store unreachable). The protected
 		// request itself succeeded — return its result and surface the
 		// store error.
@@ -572,14 +572,14 @@ func classifyOutcome(s Settings, err error) Outcome {
 // admit is the read-modify-write step that decides whether to admit a new
 // request. It runs as an UpdateFunc against the Store so distributed
 // implementations can serialize admission across processes.
-func (cb *CircuitBreaker[T]) admit(ctx context.Context) (Snapshot, error) {
+func (cb *CircuitBreaker[T]) admit(ctx context.Context, settings Settings) (Snapshot, error) {
 	var (
 		admitted     bool
 		admitErr     error
 		stateChanges []stateChange
 	)
 
-	snap, storeErr := cb.runUpdate(ctx, func(current Snapshot, now time.Time) (Snapshot, error) {
+	snap, storeErr := cb.runUpdateWith(ctx, settings, func(current Snapshot, now time.Time) (Snapshot, error) {
 		// Reset per-call accumulators (the closure may run multiple
 		// times if the store retries on conflict).
 		admitted = false
@@ -592,13 +592,13 @@ func (cb *CircuitBreaker[T]) admit(ctx context.Context) (Snapshot, error) {
 				State:           StateClosed,
 				Generation:      1,
 				GenerationStart: now,
-				Expiry:          cb.closedExpiry(now),
+				Expiry:          closedExpiryFor(now, settings.Interval),
 			}
 		}
 
 		// Apply any pending time-based transitions before deciding
 		// admission.
-		next = cb.advanceTime(next, now, &stateChanges)
+		next = advanceTime(next, now, settings, &stateChanges)
 
 		switch next.State {
 		case StateOpen:
@@ -606,13 +606,13 @@ func (cb *CircuitBreaker[T]) admit(ctx context.Context) (Snapshot, error) {
 			return next, nil
 
 		case StateHalfOpen:
-			if next.Counts.InFlights >= cb.settings.HalfOpenMaxInFlights {
+			if next.Counts.InFlights >= settings.HalfOpenMaxInFlights {
 				admitErr = ErrTooManyRequests
 				return next, nil
 			}
-			if cb.settings.HalfOpenAdmission != nil {
+			if settings.HalfOpenAdmission != nil {
 				elapsed := now.Sub(next.GenerationStart)
-				if !cb.settings.HalfOpenAdmission.Admit(elapsed) {
+				if !settings.HalfOpenAdmission.Admit(elapsed) {
 					admitErr = ErrTooManyRequests
 					return next, nil
 				}
@@ -631,7 +631,7 @@ func (cb *CircuitBreaker[T]) admit(ctx context.Context) (Snapshot, error) {
 		return Snapshot{}, storeErr
 	}
 
-	cb.fireStateChanges(stateChanges)
+	fireStateChanges(settings, stateChanges)
 
 	if !admitted {
 		// Return the snapshot we observed even on rejection so the
@@ -649,14 +649,14 @@ func (cb *CircuitBreaker[T]) admit(ctx context.Context) (Snapshot, error) {
 // admitted; if the breaker has since rotated to a new generation (via state
 // change or interval rollover), the outcome is discarded — it would be
 // counted against a stale window.
-func (cb *CircuitBreaker[T]) report(ctx context.Context, generationAtAdmit uint64, callErr error) error {
+func (cb *CircuitBreaker[T]) report(ctx context.Context, settings Settings, generationAtAdmit uint64, callErr error) error {
 	var stateChanges []stateChange
 
-	_, storeErr := cb.runUpdate(ctx, func(current Snapshot, now time.Time) (Snapshot, error) {
+	_, storeErr := cb.runUpdateWith(ctx, settings, func(current Snapshot, now time.Time) (Snapshot, error) {
 		stateChanges = stateChanges[:0]
 
 		next := current
-		next = cb.advanceTime(next, now, &stateChanges)
+		next = advanceTime(next, now, settings, &stateChanges)
 
 		// If the generation moved on while the request was in flight,
 		// the in-flight slot has already been reset by the rollover —
@@ -666,19 +666,19 @@ func (cb *CircuitBreaker[T]) report(ctx context.Context, generationAtAdmit uint6
 		}
 
 		switch {
-		case cb.settings.IsExcluded(callErr):
+		case settings.IsExcluded(callErr):
 			next.Counts.onExclusion()
 
-		case cb.settings.IsSuccessful(callErr):
+		case settings.IsSuccessful(callErr):
 			next.Counts.onSuccess()
 			switch next.State {
 			case StateClosed:
-				if cb.settings.ReadyToOpen(next.Counts) {
-					next = cb.transition(next, StateOpen, now, &stateChanges)
+				if settings.ReadyToOpen(next.Counts) {
+					next = transition(next, StateOpen, now, settings, &stateChanges)
 				}
 			case StateHalfOpen:
-				if cb.settings.ReadyToClose(next.Counts) {
-					next = cb.transition(next, StateClosed, now, &stateChanges)
+				if settings.ReadyToClose(next.Counts) {
+					next = transition(next, StateClosed, now, settings, &stateChanges)
 				}
 			}
 
@@ -686,12 +686,12 @@ func (cb *CircuitBreaker[T]) report(ctx context.Context, generationAtAdmit uint6
 			next.Counts.onFailure()
 			switch next.State {
 			case StateClosed:
-				if cb.settings.ReadyToOpen(next.Counts) {
-					next = cb.transition(next, StateOpen, now, &stateChanges)
+				if settings.ReadyToOpen(next.Counts) {
+					next = transition(next, StateOpen, now, settings, &stateChanges)
 				}
 			case StateHalfOpen:
-				if cb.settings.ReadyToReopen(next.Counts) {
-					next = cb.transition(next, StateOpen, now, &stateChanges)
+				if settings.ReadyToReopen(next.Counts) {
+					next = transition(next, StateOpen, now, settings, &stateChanges)
 				}
 			}
 		}
@@ -706,7 +706,7 @@ func (cb *CircuitBreaker[T]) report(ctx context.Context, generationAtAdmit uint6
 	// its budget. Emitting OnStateChange on such a path would report
 	// transitions that were never persisted.
 	if storeErr == nil {
-		cb.fireStateChanges(stateChanges)
+		fireStateChanges(settings, stateChanges)
 	}
 	return storeErr
 }
@@ -724,11 +724,11 @@ type stateChange struct {
 // advanceTime applies time-based transitions (open → half-open after
 // Timeout, closed → closed at Interval boundary). It does not perform
 // outcome-driven transitions; those are handled in report.
-func (cb *CircuitBreaker[T]) advanceTime(snap Snapshot, now time.Time, changes *[]stateChange) Snapshot {
+func advanceTime(snap Snapshot, now time.Time, settings Settings, changes *[]stateChange) Snapshot {
 	switch snap.State {
 	case StateOpen:
 		if !snap.Expiry.IsZero() && !now.Before(snap.Expiry) {
-			snap = cb.transition(snap, StateHalfOpen, now, changes)
+			snap = transition(snap, StateHalfOpen, now, settings, changes)
 		}
 	case StateClosed:
 		if !snap.Expiry.IsZero() && !now.Before(snap.Expiry) {
@@ -737,7 +737,7 @@ func (cb *CircuitBreaker[T]) advanceTime(snap Snapshot, now time.Time, changes *
 			snap.Generation++
 			snap.Counts.reset()
 			snap.GenerationStart = now
-			snap.Expiry = cb.closedExpiry(now)
+			snap.Expiry = closedExpiryFor(now, settings.Interval)
 		}
 	}
 	return snap
@@ -745,7 +745,7 @@ func (cb *CircuitBreaker[T]) advanceTime(snap Snapshot, now time.Time, changes *
 
 // transition records a state change in changes and returns a snapshot in the
 // new generation with reset Counts and recomputed Expiry.
-func (cb *CircuitBreaker[T]) transition(snap Snapshot, to State, now time.Time, changes *[]stateChange) Snapshot {
+func transition(snap Snapshot, to State, now time.Time, settings Settings, changes *[]stateChange) Snapshot {
 	if snap.State == to {
 		return snap
 	}
@@ -762,22 +762,31 @@ func (cb *CircuitBreaker[T]) transition(snap Snapshot, to State, now time.Time, 
 
 	switch to {
 	case StateClosed:
-		snap.Expiry = cb.closedExpiry(now)
+		snap.Expiry = closedExpiryFor(now, settings.Interval)
 	case StateOpen:
-		snap.Expiry = now.Add(cb.settings.Timeout)
+		snap.Expiry = now.Add(settings.Timeout)
 	case StateHalfOpen:
 		snap.Expiry = time.Time{}
 	}
 	return snap
 }
 
-// closedExpiry returns the expiry for the closed state given now and
-// Settings.Interval. Zero Interval means "no expiry".
-func (cb *CircuitBreaker[T]) closedExpiry(now time.Time) time.Time {
-	if cb.settings.Interval <= 0 {
+// closedExpiry returns the expiry for the closed state. Zero Interval
+// means "no expiry". The interval parameter is passed explicitly to
+// avoid reading cb.settings outside a lock — callers must capture the
+// interval from a settings snapshot taken under the appropriate lock.
+func closedExpiryFor(now time.Time, interval time.Duration) time.Time {
+	if interval <= 0 {
 		return time.Time{}
 	}
-	return now.Add(cb.settings.Interval)
+	return now.Add(interval)
+}
+
+// closedExpiry is the legacy helper that reads interval from
+// cb.settings. It is ONLY safe to call from code paths that hold
+// cb.inlineMu (the fast path) or cb.mu.RLock (the generic path).
+func (cb *CircuitBreaker[T]) closedExpiry(now time.Time) time.Time {
+	return closedExpiryFor(now, cb.settings.Interval)
 }
 
 // fireStateChanges invokes OnStateChange and Observer.OnStateChange for
@@ -785,16 +794,10 @@ func (cb *CircuitBreaker[T]) closedExpiry(now time.Time) time.Time {
 // so callbacks run without the breaker (or the Store) holding any locks.
 // Callbacks are free to call back into cb.State / cb.Counts without
 // deadlocking — fixing sony/gobreaker #37.
-func (cb *CircuitBreaker[T]) fireStateChanges(changes []stateChange) {
+func fireStateChanges(s Settings, changes []stateChange) {
 	if len(changes) == 0 {
 		return
 	}
-	// Read settings once for all changes. This is called from the
-	// generic (non-fast) executeStore path where settings is not
-	// captured in advance. The read here is outside any lock but
-	// Settings is a value type, so the read is a consistent snapshot
-	// of the struct at this instant.
-	s := cb.settings
 	for _, ch := range changes {
 		if s.OnStateChange != nil {
 			s.OnStateChange(s.Name, ch.from, ch.to, ch.counts)
@@ -808,27 +811,41 @@ func (cb *CircuitBreaker[T]) fireStateChanges(changes []stateChange) {
 // loadSnapshot reads the current snapshot from the Store, transparently
 // falling back to the local store on Store error if the policy permits.
 func (cb *CircuitBreaker[T]) loadSnapshot(ctx context.Context) (Snapshot, error) {
-	snap, err := cb.store.Get(ctx, cb.settings.Name)
+	settings := cb.loadSettings()
+	return cb.loadSnapshotWith(ctx, settings)
+}
+
+// loadSnapshotWith is like loadSnapshot but uses a pre-captured Settings
+// to avoid reading cb.settings without a lock.
+func (cb *CircuitBreaker[T]) loadSnapshotWith(ctx context.Context, settings Settings) (Snapshot, error) {
+	snap, err := cb.store.Get(ctx, settings.Name)
 	if err == nil {
 		return snap, nil
 	}
-	if cb.settings.OnStoreFailure == FailFast {
+	if settings.OnStoreFailure == FailFast {
 		return Snapshot{}, fmt.Errorf("%w: %w", ErrStoreUnavailable, err)
 	}
-	return cb.localFallbackStore().Get(ctx, cb.settings.Name)
+	return cb.localFallbackStore().Get(ctx, settings.Name)
 }
 
 // runUpdate dispatches an UpdateFunc to the Store, transparently falling
 // back to the local store on Store error if the policy permits.
 func (cb *CircuitBreaker[T]) runUpdate(ctx context.Context, fn UpdateFunc) (Snapshot, error) {
-	snap, err := cb.store.Update(ctx, cb.settings.Name, fn)
+	settings := cb.loadSettings()
+	return cb.runUpdateWith(ctx, settings, fn)
+}
+
+// runUpdateWith is like runUpdate but uses a pre-captured Settings to
+// avoid reading cb.settings without a lock.
+func (cb *CircuitBreaker[T]) runUpdateWith(ctx context.Context, settings Settings, fn UpdateFunc) (Snapshot, error) {
+	snap, err := cb.store.Update(ctx, settings.Name, fn)
 	if err == nil {
 		return snap, nil
 	}
-	if cb.settings.OnStoreFailure == FailFast {
+	if settings.OnStoreFailure == FailFast {
 		return Snapshot{}, fmt.Errorf("%w: %w", ErrStoreUnavailable, err)
 	}
-	return cb.localFallbackStore().Update(ctx, cb.settings.Name, fn)
+	return cb.localFallbackStore().Update(ctx, settings.Name, fn)
 }
 
 // localFallbackStore returns the lazily-allocated local fallback store.
