@@ -2,6 +2,7 @@ package gobreaker
 
 import (
 	"context"
+	"fmt"
 	"sync"
 )
 
@@ -61,14 +62,27 @@ func (d *Deduplicator[T]) ExecuteDedup(ctx context.Context, key string, req func
 	d.mu.Unlock()
 
 	// Panic safety: if Execute re-raises a panic from the wrapped
-	// function, wg.Done() and the key cleanup MUST still run.
-	// Without this defer, a panic would deadlock every goroutine
-	// waiting on c.wg.Wait() and permanently lock the key.
+	// function, we must:
+	//   1. Set c.err so waiters see an error (not a silent nil)
+	//   2. Call c.wg.Done() so waiters unblock
+	//   3. Clean up the key from the in-flight map
+	//   4. Re-raise the panic for the original caller
+	//
+	// Without this, a panic would either deadlock waiters (if
+	// wg.Done is missed) or silently return (zero, nil) to them
+	// (if c.err is never set because the assignment didn't complete).
 	defer func() {
+		r := recover()
+		if r != nil {
+			c.err = fmt.Errorf("gobreaker: deduplicated request panicked: %v", r)
+		}
 		c.wg.Done()
 		d.mu.Lock()
 		delete(d.in, key)
 		d.mu.Unlock()
+		if r != nil {
+			panic(r)
+		}
 	}()
 
 	c.val, c.err = d.cb.Execute(ctx, req)

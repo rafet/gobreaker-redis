@@ -78,11 +78,14 @@ func (b *PipelineBuilder[T]) Build() *Pipeline[T] {
 						return lastResult, nil
 					}
 					if i < attempts-1 && retryDelay > 0 {
+						timer := time.NewTimer(retryDelay)
 						select {
-						case <-time.After(retryDelay):
+						case <-timer.C:
 						case <-ctx.Done():
+							timer.Stop()
 							return lastResult, ctx.Err()
 						}
+						timer.Stop()
 					}
 				}
 				return lastResult, lastErr
