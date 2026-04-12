@@ -90,15 +90,16 @@ Zero allocations. Tied with the fastest mutex-based libraries. [Full methodology
 
 | Library | Closed (ns/op) | Open Reject (ns/op) | Parallel (ns/op) | Allocs |
 |---|---:|---:|---:|---:|
-| mercari/go-circuitbreaker | 10.6 | 8.9 | 70.9 | 0 |
-| **gobreaker-redis** | **72.5** | **42.8** | **249** | **0** |
-| sony/gobreaker v1 | 72.7 | 35.8 | 241 | 0 |
-| sony/gobreaker v2 | 73.9 | 36.0 | 241 | 0 |
-| rubyist/circuitbreaker | 76.7 | 68.1 | 305 | 0 |
-| cep21/circuit v4 | 246.8 | 73.1 | 176 | 3-6 |
-| failsafe-go | 223.4 | 193.5 | 387 | 13-16 |
+| mercari/go-circuitbreaker | 12.8 | 9.9 | 68.7 | 0 |
+| sony/gobreaker v1 | 75.0 | 44.3 | 233.7 | 0 |
+| sony/gobreaker v2 | 76.4 | 37.2 | 250.8 | 0 |
+| **gobreaker-redis** | **77.6** | **44.5** | **241.1** | **0** |
+| rubyist/circuitbreaker | 79.1 | 70.4 | 320.3 | 0 |
+| failsafe-go | 233.6 | 214.2 | 412.8 | 13-16 |
+| cep21/circuit v4 | 269.1 | 86.9 | 204.8 | 1-6 |
+| exaring/hoglet | 613.1 | 49.9 | 492.8 | 1-5 |
 
-> mercari is faster because it uses atomic counters and gives up distributed support, per-key grouping, customizable transitions, and observability. For real workloads where the protected call takes microseconds, the difference is invisible.
+> mercari is 6x faster because it uses lock-free atomic counters and gives up distributed support, per-key grouping, customizable transitions, and observability. We are tied with sony/gobreaker — the ~3ns gap is within measurement noise. For real workloads where the protected call takes microseconds, the difference is invisible.
 
 ## Feature matrix
 
@@ -110,14 +111,26 @@ Zero allocations. Tied with the fastest mutex-based libraries. [Full methodology
 | Multi-backend (Valkey/KeyDB/Dragonfly) | ✅ | - | - | - | - |
 | Redis outage fallback | ✅ | - | - | - | - |
 | Custom transitions | ✅ | - | - | ✅ | - |
+| Latency-aware tripping (P50/P99) | ✅ | - | - | - | - |
+| Adaptive thresholds | ✅ | - | - | - | - |
+| Gradual half-open ramp | ✅ | - | - | - | - |
 | Per-key breakers (`Group`) | ✅ | - | - | ✅ | - |
+| Group TTL / eviction | ✅ | - | - | - | - |
 | Fallback function | ✅ | - | - | ✅ | ✅ |
+| Hedging (speculative execution) | ✅ | - | - | - | ✅ |
+| Pipeline (CB + retry + timeout) | ✅ | - | - | - | ✅ |
+| Request deduplication | ✅ | - | - | - | - |
+| Force open / close / reset | ✅ | - | - | ✅ | - |
+| Runtime config update | ✅ | - | - | - | - |
 | Observer / metrics | ✅ | - | - | ✅ | ✅ |
-| HTTP presets | ✅ | - | - | - | - |
+| HTTP middleware | ✅ | - | - | - | - |
+| HTTP status presets | ✅ | - | - | - | - |
+| K8s readiness endpoint | ✅ | - | - | - | - |
+| Breaker interface (mockable) | ✅ | - | - | - | - |
 | In-flight tracking | ✅ | - | - | ✅ | - |
 | Zero alloc hot path | ✅ | ✅ | ✅ | - | - |
 | Panic safety | ✅ | ✅ | - | - | - |
-| Retry / Bulkhead | - | - | - | - | ✅ |
+| Retry / Bulkhead / Rate limit | - | - | - | - | ✅ |
 
 ## Backend compatibility
 
