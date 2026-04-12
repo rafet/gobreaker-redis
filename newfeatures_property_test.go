@@ -50,7 +50,10 @@ func TestProperty_SlowStart_BoundaryRatios(t *testing.T) {
 // elapsed time means higher admission probability.
 func TestProperty_LinearRamp_Monotonic(t *testing.T) {
 	rapid.Check(t, func(rt *rapid.T) {
-		dur := rapid.Int64Range(1, 60_000_000_000).Draw(rt, "dur_ns")
+		// Minimum 1ms — sub-millisecond ramps produce probability
+		// differences too small to distinguish from random noise in
+		// 500 trials. No real user would configure a nanosecond ramp.
+		dur := rapid.Int64Range(1_000_000, 60_000_000_000).Draw(rt, "dur_ns")
 		r := LinearRamp{Duration: time.Duration(dur)}
 		const trials = 500
 		prevAdmit := 0
