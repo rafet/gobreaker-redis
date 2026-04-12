@@ -2,6 +2,7 @@ package gobreaker
 
 import (
 	"context"
+	"fmt"
 	"time"
 )
 
@@ -74,6 +75,12 @@ func Hedge[T any](
 	ch := make(chan result, cfg.maxReqs)
 
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				var zero T
+				ch <- result{zero, fmt.Errorf("gobreaker: hedged request panicked: %v", r)}
+			}
+		}()
 		v, err := cb.Execute(primaryCtx, req)
 		ch <- result{v, err}
 	}()
@@ -97,6 +104,12 @@ func Hedge[T any](
 	defer hedgeCancel()
 
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				var zero T
+				ch <- result{zero, fmt.Errorf("gobreaker: hedged request panicked: %v", r)}
+			}
+		}()
 		v, err := cb.Execute(hedgeCtx, req)
 		ch <- result{v, err}
 	}()
