@@ -105,6 +105,49 @@ The same code now coordinates state across every process that talks to the same 
 | [`example/http`](example/http) | HTTP client with `httpcb.OnlyServerErrors` |
 | [`example/fallback`](example/fallback) | Cached fallback via `ExecuteWithFallback` |
 
+## Performance
+
+Benchmarked against 7 other Go circuit breaker libraries on identical no-op workloads (Apple M4 Pro, Go 1.24). Full methodology and commentary in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+
+| Library | Closed Success | Open Reject | Closed Parallel | Allocs |
+|---|---:|---:|---:|---:|
+| mercari/go-circuitbreaker | 10.6 ns | 8.9 ns | 70.9 ns | 0 |
+| **rafet/gobreaker-redis (us)** | **72.5 ns** | **42.8 ns** | **249 ns** | **0** |
+| sony/gobreaker v1 | 72.7 ns | 35.8 ns | 241 ns | 0 |
+| sony/gobreaker v2 | 73.9 ns | 36.0 ns | 241 ns | 0 |
+| rubyist/circuitbreaker | 76.7 ns | 68.1 ns | 305 ns | 0 |
+| cep21/circuit v4 | 246.8 ns | 73.1 ns | 176 ns | 3-6 |
+| exaring/hoglet | 356.6 ns | 42.4 ns | 343 ns | 1-5 |
+| failsafe-go | 223.4 ns | 193.5 ns | 387 ns | 13-16 |
+
+We are **tied with sony/gobreaker** on the success path (72.5 vs 72.7 ns) with zero heap allocations. Mercari is 7x faster because it uses atomic counters exclusively and trades away the Store interface, per-key Group, Observer, and customizable transitions. For the other 99% of workloads where the protected call takes microseconds, the difference is invisible.
+
+### Feature comparison
+
+| Feature | gobreaker-redis | sony v1 | sony v2 | mercari | cep21 | failsafe-go | hoglet | rubyist |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| Generics (`CircuitBreaker[T]`) | ✅ | - | ✅ | - | - | ✅ | ✅ | - |
+| `context.Context` first | ✅ | - | - | ✅ | ✅ | ✅ | ✅ | - |
+| Distributed (Redis-backed) | ✅ | - | ✅ | - | - | - | - | - |
+| Multiple backend support (Valkey, KeyDB, Dragonfly) | ✅ | - | - | - | - | - | - | - |
+| Redis outage fallback (`FallbackToLocal`) | ✅ | - | - | - | - | - | - | - |
+| Customizable transitions (`ReadyToOpen/Close/Reopen`) | ✅ | - | - | - | ✅ | - | - | - |
+| Half-open admission control (`HalfOpenMaxInFlights`) | ✅ | ✅ | ✅ | ✅ | - | ✅ | - | - |
+| `ExecuteWithFallback` | ✅ | - | - | - | ✅ | ✅ | - | - |
+| Per-key / per-tenant breakers (`Group`) | ✅ | - | - | - | ✅ | - | - | - |
+| Observer / metrics interface | ✅ | - | - | - | ✅ | ✅ | - | - |
+| `IsExcluded` for neutral outcomes | ✅ | - | ✅ | ✅ | - | - | ✅ | - |
+| HTTP status presets (`httpcb`) | ✅ | - | - | - | - | - | - | - |
+| Deadlock-safe `OnStateChange` | ✅ | - | - | ✅ | ✅ | ✅ | - | - |
+| Pre-transition Counts in callback | ✅ | - | - | - | - | - | - | - |
+| `InFlights` counter | ✅ | - | - | - | ✅ | - | - | - |
+| Sliding window | - | - | ✅ | - | ✅ | ✅ | ✅ | - |
+| Retry / Bulkhead / Rate limit | - | - | - | - | - | ✅ | - | - |
+| Zero alloc hot path | ✅ | ✅ | ✅ | ✅ | - | - | - | ✅ |
+| Panic safety | ✅ | ✅ | ✅ | - | - | - | - | - |
+
+**Key takeaway**: gobreaker-redis is the only library that combines distributed state (Redis/Valkey/KeyDB/Dragonfly), fully customizable transitions, per-key grouping, fallback, observability, AND zero-allocation performance. Sony v2 has distributed support but uses redsync (lock-based, more round-trips) and lacks transition customization, per-key groups, and fallback. Mercari is faster but single-process only. failsafe-go is broader (retry, bulkhead, rate limit) but significantly slower and single-process only.
+
 ## Why another circuit breaker?
 
 If you only need single-process breakers and your team already runs sony/gobreaker, **keep using it**. It's well-known, simple, and battle-tested for that use case.
