@@ -1,508 +1,807 @@
-// Package gobreaker implements the Circuit Breaker pattern.
-// See https://msdn.microsoft.com/en-us/library/dn589784.aspx.
+// Package gobreaker implements a distributed-first circuit breaker.
+//
+// The package separates two concerns that are usually conflated in
+// circuit-breaker libraries:
+//
+//   - The state machine, implemented in this file as a pure transformation
+//     from one Snapshot to the next. The state machine is deterministic and
+//     has no I/O.
+//   - The persistence backend, defined by the Store interface. Two
+//     implementations ship with the module: LocalStore (in-memory,
+//     goroutine-safe, in this package) and RespStore (Redis/Valkey/KeyDB/
+//     DragonflyDB, in the respstore subpackage).
+//
+// This separation makes the breaker correct by construction across both
+// single-process and multi-process deployments: the state machine is the
+// same in both cases, only the Store changes.
+//
+// # Quick start
+//
+//	cb, err := gobreaker.New[*http.Response](ctx, gobreaker.Settings{
+//	    Name:    "user-service",
+//	    Timeout: 30 * time.Second,
+//	})
+//	if err != nil { /* ... */ }
+//
+//	resp, err := cb.Execute(ctx, func(ctx context.Context) (*http.Response, error) {
+//	    return http.DefaultClient.Do(req.WithContext(ctx))
+//	})
+//
+// See the package examples and docs/DESIGN.md for the rationale behind the
+// state-machine choices.
 package gobreaker
 
 import (
-	"errors"
+	"context"
 	"fmt"
 	"sync"
 	"time"
-
-	"github.com/go-redis/redis"
 )
 
-// State is a type that represents a state of CircuitBreaker.
-type State int
-
-// These constants are states of CircuitBreaker.
-const (
-	StateClosed State = iota
-	StateHalfOpen
-	StateOpen
-)
-
-var (
-	// ErrOpenState is returned when the CB state is open
-	ErrOpenState = errors.New("circuit breaker is open")
-)
-
-// String implements stringer interface.
-func (s State) String() string {
-	switch s {
-	case StateClosed:
-		return "closed"
-	case StateHalfOpen:
-		return "half-open"
-	case StateOpen:
-		return "open"
-	default:
-		return fmt.Sprintf("unknown state: %d", s)
-	}
-}
-
-// Counts holds the numbers of requests and their successes/failures.
-// CircuitBreaker clears the internal Counts either
-// on the change of the state or at the closed-state intervals.
-// Counts ignores the results of the requests sent before clearing.
-type Counts struct {
-	Requests             uint32
-	ConsecutiveSuccesses uint32
-	ConsecutiveFailures  uint32
-
-	CB *CircuitBreaker
-}
-
-func (c *Counts) onRequest() uint32 {
-	key := fmt.Sprintf("%s:%s:cb:counts", c.CB.redisKeyPrefix, c.CB.name)
-	requestCount := c.CB.redisClient.Incr(key).Val()
-
-	return uint32(requestCount)
-}
-
-func (c *Counts) onSuccess() {
-	pipe := c.CB.redisClient.Pipeline()
-
-	key := fmt.Sprintf("%s:%s:cb:consecutive_successes", c.CB.redisKeyPrefix, c.CB.name)
-	pipe.Incr(key)
-
-	key = fmt.Sprintf("%s:%s:cb:consecutive_failures", c.CB.redisKeyPrefix, c.CB.name)
-	pipe.Del(key)
-
-	pipe.Exec()
-}
-
-func (c *Counts) onFailure() {
-	pipe := c.CB.redisClient.Pipeline()
-
-	key := fmt.Sprintf("%s:%s:cb:consecutive_failures", c.CB.redisKeyPrefix, c.CB.name)
-	pipe.Incr(key)
-
-	key = fmt.Sprintf("%s:%s:cb:consecutive_successes", c.CB.redisKeyPrefix, c.CB.name)
-	pipe.Del(key)
-
-	pipe.Exec()
-}
-
-func (c *Counts) clear() {
-	keys := []string{
-		fmt.Sprintf("%s:%s:cb:counts", c.CB.redisKeyPrefix, c.CB.name),
-		fmt.Sprintf("%s:%s:cb:consecutive_successes", c.CB.redisKeyPrefix, c.CB.name),
-		fmt.Sprintf("%s:%s:cb:consecutive_failures", c.CB.redisKeyPrefix, c.CB.name),
-	}
-	c.CB.redisClient.Del(keys...)
-}
-
-func (c *Counts) GetConsecutiveSuccesses() uint32 {
-	key := fmt.Sprintf("%s:%s:cb:consecutive_successes", c.CB.redisKeyPrefix, c.CB.name)
-	val, err := c.CB.redisClient.Get(key).Uint64()
-	if err != nil {
-		return 0
-	}
-	return uint32(val)
-}
-
-func (c *Counts) GetConsecutiveFailures() uint32 {
-	key := fmt.Sprintf("%s:%s:cb:consecutive_failures", c.CB.redisKeyPrefix, c.CB.name)
-	val, err := c.CB.redisClient.Get(key).Uint64()
-	if err != nil {
-		return 0
-	}
-	return uint32(val)
-}
-
-func (c *Counts) GetRequests() uint32 {
-	key := fmt.Sprintf("%s:%s:cb:counts", c.CB.redisKeyPrefix, c.CB.name)
-	val, err := c.CB.redisClient.Get(key).Uint64()
-	if err != nil {
-		return 0
-	}
-	return uint32(val)
-}
-
-func (c *Counts) LoadFromRedis() {
-	c.Requests = c.GetRequests()
-	c.ConsecutiveSuccesses = c.GetConsecutiveSuccesses()
-	c.ConsecutiveFailures = c.GetConsecutiveFailures()
-}
-
-// Settings configures CircuitBreaker:
+// CircuitBreaker is a state machine that prevents sending requests likely to
+// fail. It is parameterised on the return type of the protected request so
+// callers do not need to perform an interface{} type assertion.
 //
-// Name is the name of the CircuitBreaker.
+// CircuitBreakers are safe for concurrent use by multiple goroutines.
+type CircuitBreaker[T any] struct {
+	settings Settings
+	store    Store
+
+	// localStore is set to a non-nil value if and only if Settings.Store
+	// is a *LocalStore. When set, Execute takes a closure-free fast path
+	// that bypasses the Store interface dispatch and directly mutates
+	// the in-memory snapshot. This eliminates per-call closure
+	// allocations that would otherwise dominate the hot path.
+	//
+	// The fast path is observable only as a performance characteristic:
+	// it produces identical state transitions and identical observer
+	// events as the generic store path.
+	localStore *LocalStore
+
+	// inlineSnap is the breaker's authoritative snapshot when running
+	// on the fast path. It is protected by inlineMu and synchronized
+	// with localStore on every read/write so the public Get/Update
+	// surface of the LocalStore continues to reflect the current
+	// state. The cached pointer here exists purely to avoid the map
+	// lookup that LocalStore.Update would otherwise perform on every
+	// request.
+	inlineMu   sync.Mutex
+	inlineSnap Snapshot
+
+	// localFallback is a single-process LocalStore used when the primary
+	// store is unreachable and OnStoreFailure is FallbackToLocal. It is
+	// lazily populated; nil until first failure.
+	mu            sync.Mutex
+	localFallback *LocalStore
+
+	// now is the clock function. Overridable for tests via setClock.
+	now func() time.Time
+}
+
+// New constructs a new CircuitBreaker. It calls Settings.Validate, applies
+// defaults, and ensures that an initial Snapshot exists in the Store.
 //
-// MaxRequests is the maximum number of requests allowed to pass through
-// when the CircuitBreaker is half-open.
-// If MaxRequests is 0, the CircuitBreaker allows only 1 request.
-//
-// Interval is the cyclic period of the closed state
-// for the CircuitBreaker to clear the internal Counts.
-// If Interval is less than or equal to 0, the CircuitBreaker doesn't clear internal Counts during the closed state.
-//
-// Timeout is the period of the open state,
-// after which the state of the CircuitBreaker becomes half-open.
-// If Timeout is less than or equal to 0, the timeout value of the CircuitBreaker is set to 60 seconds.
-//
-// ReadyToTrip is called with a copy of Counts whenever a request fails in the closed state.
-// If ReadyToTrip returns true, the CircuitBreaker will be placed into the open state.
-// If ReadyToTrip is nil, default ReadyToTrip is used.
-// Default ReadyToTrip returns true when the number of consecutive failures is more than 5.
-//
-// OnStateChange is called whenever the state of the CircuitBreaker changes.
-//
-// IsSuccessful is called with the error returned from a request.
-// If IsSuccessful returns true, the error is counted as a success.
-// Otherwise the error is counted as a failure.
-// If IsSuccessful is nil, default IsSuccessful is used, which returns false for all non-nil errors.
-type Settings struct {
-	Name          string
-	MaxRequests   uint32
-	Interval      time.Duration
-	Timeout       time.Duration
-	ReadyToTrip   func(counts Counts) bool
-	OnStateChange func(name string, from State, to State)
-	IsSuccessful  func(err error) bool
-
-	RedisClient    *redis.Client
-	RedisKeyPrefix string
-}
-
-// CircuitBreaker is a state machine to prevent sending requests that are likely to fail.
-type CircuitBreaker struct {
-	name          string
-	maxRequests   uint32
-	interval      time.Duration
-	timeout       time.Duration
-	readyToTrip   func(counts Counts) bool
-	isSuccessful  func(err error) bool
-	onStateChange func(name string, from State, to State)
-
-	mutex  sync.Mutex
-	state  State
-	counts Counts
-
-	redisClient    *redis.Client
-	redisKeyPrefix string
-}
-
-func (cb *CircuitBreaker) getState() State {
-	key := fmt.Sprintf("%s:%s:cb:state", cb.redisKeyPrefix, cb.name)
-	val, err := cb.redisClient.Get(key).Int64()
-	if err != nil {
-		return 0
-	}
-	return State(val)
-}
-
-func (cb *CircuitBreaker) _setState(state State) {
-	key := fmt.Sprintf("%s:%s:cb:state", cb.redisKeyPrefix, cb.name)
-	cb.redisClient.Set(key, int(state), 0)
-}
-
-func (cb *CircuitBreaker) getGeneration() uint64 {
-	key := fmt.Sprintf("%s:%s:cb:generation", cb.redisKeyPrefix, cb.name)
-	val, err := cb.redisClient.Get(key).Uint64()
-	if err != nil {
-		return 0
-	}
-	return val
-}
-
-func (cb *CircuitBreaker) incrGeneration() int {
-	key := fmt.Sprintf("%s:%s:cb:generation", cb.redisKeyPrefix, cb.name)
-	return int(cb.redisClient.Incr(key).Val())
-}
-
-func (cb *CircuitBreaker) getExpiry() time.Time {
-	key := fmt.Sprintf("%s:%s:cb:time:open", cb.redisKeyPrefix, cb.name)
-	val, err := cb.redisClient.Get(key).Int64()
-	t := time.Unix(val, 0)
-	if t.IsZero() || err != nil {
-		return time.Time{}
-	}
-
-	return t
-}
-
-func (cb *CircuitBreaker) setExpiry(expiry time.Time) {
-	key := fmt.Sprintf("%s:%s:cb:time:open", cb.redisKeyPrefix, cb.name)
-	cb.redisClient.Set(key, expiry.Unix(), 0)
-}
-
-// TwoStepCircuitBreaker is like CircuitBreaker but instead of surrounding a function
-// with the breaker functionality, it only checks whether a request can proceed and
-// expects the caller to report the outcome in a separate step using a callback.
-type TwoStepCircuitBreaker struct {
-	cb *CircuitBreaker
-}
-
-// NewCircuitBreaker returns a new CircuitBreaker configured with the given Settings.
-func NewCircuitBreaker(st Settings) *CircuitBreaker {
-	cb := new(CircuitBreaker)
-
-	if st.RedisClient == nil {
-		panic("redis client is nil")
-	} else {
-		cb.redisClient = st.RedisClient
-	}
-
-	cb.name = st.Name
-	cb.onStateChange = st.OnStateChange
-	cb.redisKeyPrefix = st.RedisKeyPrefix
-
-	if st.MaxRequests == 0 {
-		cb.maxRequests = 1
-	} else {
-		cb.maxRequests = st.MaxRequests
-	}
-
-	if st.Interval <= 0 {
-		cb.interval = defaultInterval
-	} else {
-		cb.interval = st.Interval
-	}
-
-	if st.Timeout <= 0 {
-		cb.timeout = defaultTimeout
-	} else {
-		cb.timeout = st.Timeout
-	}
-
-	if st.ReadyToTrip == nil {
-		cb.readyToTrip = defaultReadyToTrip
-	} else {
-		cb.readyToTrip = st.ReadyToTrip
-	}
-
-	if st.IsSuccessful == nil {
-		cb.isSuccessful = defaultIsSuccessful
-	} else {
-		cb.isSuccessful = st.IsSuccessful
-	}
-
-	cb.counts.CB = cb
-	cb.counts.LoadFromRedis()
-
-	if cb.redisClient.Exists(fmt.Sprintf("%s:%s:cb:generation", cb.redisKeyPrefix, cb.name)).Val() == 0 {
-		state := cb.getState()
-		cb.toNewGeneration(time.Now(), nil, state)
-	}
-
-	return cb
-}
-
-// NewTwoStepCircuitBreaker returns a new TwoStepCircuitBreaker configured with the given Settings.
-func NewTwoStepCircuitBreaker(st Settings) *TwoStepCircuitBreaker {
-	return &TwoStepCircuitBreaker{
-		cb: NewCircuitBreaker(st),
-	}
-}
-
-const defaultInterval = time.Duration(0) * time.Second
-const defaultTimeout = time.Duration(60) * time.Second
-
-func defaultReadyToTrip(counts Counts) bool {
-	return counts.GetConsecutiveFailures() > 2
-}
-
-func defaultIsSuccessful(err error) bool {
-	return err == nil
-}
-
-// Name returns the name of the CircuitBreaker.
-func (cb *CircuitBreaker) Name() string {
-	return cb.name
-}
-
-// State returns the current state of the CircuitBreaker.
-func (cb *CircuitBreaker) State() State {
-	cb.mutex.Lock()
-	defer cb.mutex.Unlock()
-
-	now := time.Now()
-	state, _ := cb.currentState(now)
-	return state
-}
-
-// Counts returns internal counters
-func (cb *CircuitBreaker) Counts() Counts {
-	cb.mutex.Lock()
-	defer cb.mutex.Unlock()
-
-	return cb.counts
-}
-
-// Execute runs the given request if the CircuitBreaker accepts it.
-// Execute returns an error instantly if the CircuitBreaker rejects the request.
-// Otherwise, Execute returns the result of the request.
-// If a panic occurs in the request, the CircuitBreaker handles it as an error
-// and causes the same panic again.
-func (cb *CircuitBreaker) Execute(req func() (interface{}, error)) (interface{}, error) {
-	generation, err := cb.beforeRequest()
-	if err != nil {
+// New does not take ownership of Settings.Store: the caller is responsible
+// for closing it. If Settings.Store is nil, a fresh LocalStore is created
+// and owned by the breaker (Close will release it).
+func New[T any](ctx context.Context, settings Settings) (*CircuitBreaker[T], error) {
+	if err := settings.Validate(); err != nil {
 		return nil, err
 	}
+	settings = settings.defaults()
 
-	defer func() {
-		e := recover()
-		if e != nil {
-			cb.afterRequest(generation, false)
-			panic(e)
-		}
-	}()
-
-	result, err := req()
-	cb.afterRequest(generation, cb.isSuccessful(err))
-	return result, err
-}
-
-// Name returns the name of the TwoStepCircuitBreaker.
-func (tscb *TwoStepCircuitBreaker) Name() string {
-	return tscb.cb.Name()
-}
-
-// State returns the current state of the TwoStepCircuitBreaker.
-func (tscb *TwoStepCircuitBreaker) State() State {
-	return tscb.cb.State()
-}
-
-// Counts returns internal counters
-func (tscb *TwoStepCircuitBreaker) Counts() Counts {
-	return tscb.cb.Counts()
-}
-
-// Allow checks if a new request can proceed. It returns a callback that should be used to
-// register the success or failure in a separate step. If the circuit breaker doesn't allow
-// requests, it returns an error.
-func (tscb *TwoStepCircuitBreaker) Allow() (done func(success bool), err error) {
-	generation, err := tscb.cb.beforeRequest()
-	if err != nil {
-		return nil, err
+	store := settings.Store
+	if store == nil {
+		store = NewLocalStore()
+		settings.Store = store
 	}
 
-	return func(success bool) {
-		tscb.cb.afterRequest(generation, success)
+	cb := &CircuitBreaker[T]{
+		settings: settings,
+		store:    store,
+		now:      time.Now,
+	}
+	if ls, ok := store.(*LocalStore); ok {
+		cb.localStore = ls
+	}
+
+	// Materialize an initial snapshot if none exists. We route this
+	// through runUpdate (rather than store.Update directly) so that the
+	// configured OnStoreFailure policy applies during construction too —
+	// otherwise a transient backend outage would abort breaker creation
+	// even when FallbackToLocal is set.
+	snap, err := cb.runUpdate(ctx, cb.initialize)
+	if err != nil {
+		return nil, fmt.Errorf("gobreaker: initialize %q: %w", settings.Name, err)
+	}
+
+	// Cache the initial snapshot in inlineSnap so the fast path does
+	// not need to do a map lookup on the very first call. Subsequent
+	// fast-path calls keep this cache in sync.
+	if cb.localStore != nil {
+		cb.inlineSnap = snap
+	}
+
+	return cb, nil
+}
+
+// initialize is the UpdateFunc used by New. It leaves an existing snapshot
+// untouched and only initializes a fresh one.
+func (cb *CircuitBreaker[T]) initialize(current Snapshot, now time.Time) (Snapshot, error) {
+	if !current.IsZero() {
+		return current, nil
+	}
+	return Snapshot{
+		State:           StateClosed,
+		Generation:      1,
+		GenerationStart: now,
+		Expiry:          cb.closedExpiry(now),
 	}, nil
 }
 
-func (cb *CircuitBreaker) beforeRequest() (uint64, error) {
-	cb.mutex.Lock()
-	defer cb.mutex.Unlock()
-
-	now := time.Now()
-	state, generation := cb.currentState(now)
-
-	cb.counts.onRequest()
-
-	if state == StateOpen {
-		return generation, ErrOpenState
-	}
-
-	return generation, nil
+// Name returns the breaker's name.
+func (cb *CircuitBreaker[T]) Name() string {
+	return cb.settings.Name
 }
 
-func (cb *CircuitBreaker) afterRequest(before uint64, success bool) {
-	cb.mutex.Lock()
-	defer cb.mutex.Unlock()
+// State returns the current state of the breaker. For LocalStore-backed
+// breakers (the fast path) this is an in-memory read with no I/O. For
+// distributed Stores it performs a read against the Store and may incur
+// a network round-trip.
+func (cb *CircuitBreaker[T]) State(ctx context.Context) (State, error) {
+	if cb.localStore != nil {
+		cb.inlineMu.Lock()
+		state := cb.inlineSnap.State
+		expiry := cb.inlineSnap.Expiry
+		cb.inlineMu.Unlock()
+		now := cb.now()
+		if state == StateOpen && !expiry.IsZero() && !now.Before(expiry) {
+			return StateHalfOpen, nil
+		}
+		return state, nil
+	}
+	snap, err := cb.loadSnapshot(ctx)
+	if err != nil {
+		return StateClosed, err
+	}
+	now := cb.now()
+	if snap.State == StateOpen && !snap.Expiry.IsZero() && !now.Before(snap.Expiry) {
+		return StateHalfOpen, nil
+	}
+	return snap.State, nil
+}
 
+// Counts returns a snapshot of the current Counts. For LocalStore-backed
+// breakers it is an in-memory read.
+func (cb *CircuitBreaker[T]) Counts(ctx context.Context) (Counts, error) {
+	if cb.localStore != nil {
+		cb.inlineMu.Lock()
+		c := cb.inlineSnap.Counts
+		cb.inlineMu.Unlock()
+		return c, nil
+	}
+	snap, err := cb.loadSnapshot(ctx)
+	if err != nil {
+		return Counts{}, err
+	}
+	return snap.Counts, nil
+}
+
+// Execute runs req if the breaker admits it, then reports the outcome back
+// to the breaker. The state machine guarantees:
+//
+//   - In the closed state, every request is admitted. The outcome may
+//     trigger a transition to open via ReadyToOpen.
+//   - In the open state, no request is admitted: Execute returns
+//     ErrOpenState immediately. After Settings.Timeout has elapsed, the
+//     next admission attempt transitions the breaker to half-open.
+//   - In the half-open state, at most HalfOpenMaxInFlights requests are
+//     admitted concurrently. Excess admissions return ErrTooManyRequests.
+//     Successful outcomes feed ReadyToClose; failures feed ReadyToReopen.
+//
+// The supplied context is forwarded to req. If req panics, the panic is
+// recovered, recorded as a failure, and re-raised after the breaker state is
+// updated.
+func (cb *CircuitBreaker[T]) Execute(ctx context.Context, req func(ctx context.Context) (T, error)) (T, error) {
+	if cb.localStore != nil {
+		return cb.executeFast(ctx, req)
+	}
+	return cb.executeStore(ctx, req)
+}
+
+// executeStore is the generic Execute implementation that goes through the
+// Store interface. It is used whenever the breaker's Store is anything other
+// than a *LocalStore.
+func (cb *CircuitBreaker[T]) executeStore(ctx context.Context, req func(ctx context.Context) (T, error)) (T, error) {
+	var zero T
+
+	admittedSnap, err := cb.admit(ctx)
+	if err != nil {
+		// Admission was refused (or the store failed). Report the
+		// rejection to the observer if there is one. We pass the
+		// observed state where possible: admittedSnap.State is set
+		// when admit returned ErrOpenState/ErrTooManyRequests; for
+		// other errors it is the zero state, which the observer can
+		// interpret as "unknown".
+		if cb.settings.Observer != nil {
+			cb.settings.Observer.OnRequest(cb.settings.Name, false, admittedSnap.State)
+		}
+		return zero, err
+	}
+	if cb.settings.Observer != nil {
+		cb.settings.Observer.OnRequest(cb.settings.Name, true, admittedSnap.State)
+	}
+
+	// At this point the request is admitted. We must report an outcome no
+	// matter how req returns, including panics.
+	var (
+		result   T
+		callErr  error
+		panicVal any
+	)
+
+	start := cb.now()
+	func() {
+		defer func() {
+			panicVal = recover()
+		}()
+		result, callErr = req(ctx)
+	}()
+	latency := cb.now().Sub(start)
+
+	if panicVal != nil {
+		// Treat the panic as a failure outcome before re-raising.
+		_ = cb.report(ctx, admittedSnap.Generation, fmt.Errorf("gobreaker: request panicked: %v", panicVal))
+		if cb.settings.Observer != nil {
+			cb.settings.Observer.OnOutcome(cb.settings.Name, OutcomeFailure, latency)
+		}
+		panic(panicVal)
+	}
+
+	if cb.settings.Observer != nil {
+		cb.settings.Observer.OnOutcome(cb.settings.Name, classifyOutcome(cb.settings, callErr), latency)
+	}
+
+	if err := cb.report(ctx, admittedSnap.Generation, callErr); err != nil {
+		// Reporting failed (e.g. store unreachable). The protected
+		// request itself succeeded — return its result and surface the
+		// store error.
+		if callErr == nil {
+			return result, err
+		}
+		// If both the call and the report failed, the call error is
+		// more relevant to the user.
+		return result, callErr
+	}
+
+	return result, callErr
+}
+
+// executeFast is the closure-free Execute implementation that runs when the
+// breaker's Store is a *LocalStore. It produces identical observable behavior
+// to executeStore (state transitions, observer events, OnStateChange
+// callbacks) but avoids the per-call closure allocations that the Store
+// interface requires.
+//
+// The structure is otherwise the same: an admit phase that decides whether
+// to run the request, then the request itself, then a report phase that
+// updates state. Both phases acquire cb.inlineMu directly and operate on
+// cb.inlineSnap by pointer, eliminating the per-call map lookup that the
+// LocalStore.Update path would otherwise perform.
+func (cb *CircuitBreaker[T]) executeFast(ctx context.Context, req func(ctx context.Context) (T, error)) (T, error) {
+	var zero T
+
+	// ============ admit phase ============
+	cb.inlineMu.Lock()
 	now := time.Now()
-	state, generation := cb.currentState(now)
-	if generation != before {
+	if cb.localStore.now != nil {
+		now = cb.localStore.now()
+	}
+
+	snap := &cb.inlineSnap
+
+	// Apply time-based transitions before deciding admission.
+	var admitChange *stateChange
+	switch snap.State {
+	case StateOpen:
+		if !snap.Expiry.IsZero() && !now.Before(snap.Expiry) {
+			admitChange = &stateChange{from: StateOpen, to: StateHalfOpen, counts: snap.Counts}
+			snap.State = StateHalfOpen
+			snap.Generation++
+			snap.Counts.reset()
+			snap.GenerationStart = now
+			snap.Expiry = time.Time{}
+		}
+	case StateClosed:
+		if !snap.Expiry.IsZero() && !now.Before(snap.Expiry) {
+			snap.Generation++
+			snap.Counts.reset()
+			snap.GenerationStart = now
+			snap.Expiry = cb.closedExpiry(now)
+		}
+	}
+
+	var admitErr error
+	switch snap.State {
+	case StateOpen:
+		admitErr = ErrOpenState
+	case StateHalfOpen:
+		if snap.Counts.InFlights >= cb.settings.HalfOpenMaxInFlights {
+			admitErr = ErrTooManyRequests
+		}
+	}
+	if admitErr != nil {
+		snap.Version++
+		stateAtReject := snap.State
+		cb.syncToLocalStoreLocked()
+		cb.inlineMu.Unlock()
+		if admitChange != nil && (cb.settings.OnStateChange != nil || cb.settings.Observer != nil) {
+			cb.fireStateChangesSlice(admitChange)
+		}
+		if cb.settings.Observer != nil {
+			cb.settings.Observer.OnRequest(cb.settings.Name, false, stateAtReject)
+		}
+		return zero, admitErr
+	}
+
+	snap.Counts.onRequest()
+	admittedGen := snap.Generation
+	admittedState := snap.State
+	snap.Version++
+	cb.inlineMu.Unlock()
+
+	if admitChange != nil && (cb.settings.OnStateChange != nil || cb.settings.Observer != nil) {
+		cb.fireStateChangesSlice(admitChange)
+	}
+	if cb.settings.Observer != nil {
+		cb.settings.Observer.OnRequest(cb.settings.Name, true, admittedState)
+	}
+
+	// ============ run the request ============
+	var (
+		result   T
+		callErr  error
+		panicVal any
+	)
+	// Latency timing is only needed when an Observer is registered.
+	// Skipping the two cb.now() calls in the no-observer case (the
+	// vast majority of single-process production usage) shaves 60+ns
+	// off the hot path because time.Now()/runtime.walltime dominates
+	// the wall-clock cost on most platforms.
+	var start time.Time
+	hasObserver := cb.settings.Observer != nil
+	if hasObserver {
+		start = cb.now()
+	}
+	func() {
+		defer func() {
+			panicVal = recover()
+		}()
+		result, callErr = req(ctx)
+	}()
+	var latency time.Duration
+	if hasObserver {
+		latency = cb.now().Sub(start)
+	}
+
+	if panicVal != nil {
+		// Treat the panic as a failure and re-raise. We do not call
+		// the report phase for the panic path; instead we apply the
+		// failure inline and re-raise.
+		cb.reportFastInline(admittedGen, fmt.Errorf("gobreaker: request panicked: %v", panicVal))
+		if hasObserver {
+			cb.settings.Observer.OnOutcome(cb.settings.Name, OutcomeFailure, latency)
+		}
+		panic(panicVal)
+	}
+
+	if hasObserver {
+		cb.settings.Observer.OnOutcome(cb.settings.Name, classifyOutcome(cb.settings, callErr), latency)
+	}
+
+	cb.reportFastInline(admittedGen, callErr)
+	return result, callErr
+}
+
+// reportFastInline applies the outcome of an admitted request to the
+// in-memory snapshot. It is the closure-free counterpart to
+// CircuitBreaker.report. Concurrency is provided by cb.inlineMu.
+//
+// Transitions captured during the call are reported via fireStateChanges
+// after the lock is released, mirroring the executeStore guarantee that
+// callbacks never run while the breaker is locked.
+func (cb *CircuitBreaker[T]) reportFastInline(admittedGen uint64, callErr error) {
+	cb.inlineMu.Lock()
+	now := time.Now()
+	if cb.localStore.now != nil {
+		now = cb.localStore.now()
+	}
+
+	snap := &cb.inlineSnap
+
+	// Apply time-based transitions first.
+	var ch1 *stateChange
+	switch snap.State {
+	case StateOpen:
+		if !snap.Expiry.IsZero() && !now.Before(snap.Expiry) {
+			ch1 = &stateChange{from: StateOpen, to: StateHalfOpen, counts: snap.Counts}
+			snap.State = StateHalfOpen
+			snap.Generation++
+			snap.Counts.reset()
+			snap.GenerationStart = now
+			snap.Expiry = time.Time{}
+		}
+	case StateClosed:
+		if !snap.Expiry.IsZero() && !now.Before(snap.Expiry) {
+			snap.Generation++
+			snap.Counts.reset()
+			snap.GenerationStart = now
+			snap.Expiry = cb.closedExpiry(now)
+		}
+	}
+
+	if snap.Generation != admittedGen {
+		// The breaker rolled over while the request was in flight.
+		// The outcome belongs to a stale generation; drop it.
+		snap.Version++
+		cb.syncToLocalStoreLocked()
+		cb.inlineMu.Unlock()
+		if ch1 != nil {
+			cb.fireStateChangesSlice(ch1)
+		}
 		return
 	}
 
-	if success {
-		cb.onSuccess(state, now)
-	} else {
-		cb.onFailure(state, now)
-	}
-}
-
-func (cb *CircuitBreaker) onSuccess(state State, now time.Time) {
-	switch state {
-	case StateClosed:
-		cb.counts.onSuccess()
-	case StateHalfOpen:
-		cb.counts.onSuccess()
-		if cb.counts.GetConsecutiveSuccesses() >= cb.maxRequests {
-			cb.setState(state, StateClosed, now)
+	var ch2 *stateChange
+	switch {
+	case cb.settings.IsExcluded(callErr):
+		snap.Counts.onExclusion()
+	case cb.settings.IsSuccessful(callErr):
+		snap.Counts.onSuccess()
+		if snap.State == StateHalfOpen && cb.settings.ReadyToClose(snap.Counts) {
+			ch2 = &stateChange{from: snap.State, to: StateClosed, counts: snap.Counts}
+			snap.State = StateClosed
+			snap.Generation++
+			snap.Counts.reset()
+			snap.GenerationStart = now
+			snap.Expiry = cb.closedExpiry(now)
 		}
 	default:
+		snap.Counts.onFailure()
+		switch snap.State {
+		case StateClosed:
+			if cb.settings.ReadyToOpen(snap.Counts) {
+				ch2 = &stateChange{from: snap.State, to: StateOpen, counts: snap.Counts}
+				snap.State = StateOpen
+				snap.Generation++
+				snap.Counts.reset()
+				snap.GenerationStart = now
+				snap.Expiry = now.Add(cb.settings.Timeout)
+			}
+		case StateHalfOpen:
+			if cb.settings.ReadyToReopen(snap.Counts) {
+				ch2 = &stateChange{from: snap.State, to: StateOpen, counts: snap.Counts}
+				snap.State = StateOpen
+				snap.Generation++
+				snap.Counts.reset()
+				snap.GenerationStart = now
+				snap.Expiry = now.Add(cb.settings.Timeout)
+			}
+		}
+	}
+
+	snap.Version++
+	cb.inlineMu.Unlock()
+
+	if ch1 != nil {
+		cb.fireStateChangesSlice(ch1)
+	}
+	if ch2 != nil {
+		cb.fireStateChangesSlice(ch2)
 	}
 }
 
-func (cb *CircuitBreaker) onFailure(state State, now time.Time) {
-	switch state {
-	case StateClosed:
-		cb.counts.onFailure()
-		if cb.readyToTrip(cb.counts) {
-			cb.setState(state, StateOpen, now)
-		}
-	case StateHalfOpen:
-		cb.setState(state, StateOpen, now)
-	default:
+// syncToLocalStoreLocked publishes the in-memory inlineSnap into the
+// underlying LocalStore so the public Get/Update surface keeps
+// observing the same state. The caller must hold cb.inlineMu.
+//
+// We deliberately use a separate mutex (LocalStore.mu) here even though
+// it makes the lock ordering subtle: callers that mutate the
+// LocalStore directly via Update will see the inlineSnap value after
+// our publish. The two locks are never held in inverse order so there
+// is no deadlock potential.
+func (cb *CircuitBreaker[T]) syncToLocalStoreLocked() {
+	cb.localStore.mu.Lock()
+	if !cb.localStore.closed {
+		cb.localStore.data[cb.settings.Name] = cb.inlineSnap
+	}
+	cb.localStore.mu.Unlock()
+}
+
+// fireStateChangesSlice is a single-stateChange convenience over
+// fireStateChanges. It exists so the fast path can pass a *stateChange
+// without allocating a backing slice on the heap on the steady-state
+// success path (where no transition occurs and the function is never
+// called).
+func (cb *CircuitBreaker[T]) fireStateChangesSlice(ch *stateChange) {
+	if cb.settings.OnStateChange != nil {
+		cb.settings.OnStateChange(cb.settings.Name, ch.from, ch.to, ch.counts)
+	}
+	if cb.settings.Observer != nil {
+		cb.settings.Observer.OnStateChange(cb.settings.Name, ch.from, ch.to, ch.counts)
 	}
 }
 
-func (cb *CircuitBreaker) currentState(now time.Time) (State, uint64) {
-	expiry := cb.getExpiry()
-	state := cb.getState()
-	currState := state
+// classifyOutcome maps a request error to its Outcome label using the
+// breaker's IsExcluded and IsSuccessful predicates.
+func classifyOutcome(s Settings, err error) Outcome {
+	if s.IsExcluded(err) {
+		return OutcomeExclusion
+	}
+	if s.IsSuccessful(err) {
+		return OutcomeSuccess
+	}
+	return OutcomeFailure
+}
 
-	switch state {
-	case StateClosed:
-		if !expiry.IsZero() && expiry.Before(now) {
-			cb.toNewGeneration(now, &expiry, state)
+// admit is the read-modify-write step that decides whether to admit a new
+// request. It runs as an UpdateFunc against the Store so distributed
+// implementations can serialize admission across processes.
+func (cb *CircuitBreaker[T]) admit(ctx context.Context) (Snapshot, error) {
+	var (
+		admitted     bool
+		admitErr     error
+		stateChanges []stateChange
+	)
+
+	snap, storeErr := cb.runUpdate(ctx, func(current Snapshot, now time.Time) (Snapshot, error) {
+		// Reset per-call accumulators (the closure may run multiple
+		// times if the store retries on conflict).
+		admitted = false
+		admitErr = nil
+		stateChanges = stateChanges[:0]
+
+		next := current
+		if next.IsZero() {
+			next = Snapshot{
+				State:           StateClosed,
+				Generation:      1,
+				GenerationStart: now,
+				Expiry:          cb.closedExpiry(now),
+			}
 		}
+
+		// Apply any pending time-based transitions before deciding
+		// admission.
+		next = cb.advanceTime(next, now, &stateChanges)
+
+		switch next.State {
+		case StateOpen:
+			admitErr = ErrOpenState
+			return next, nil
+
+		case StateHalfOpen:
+			if next.Counts.InFlights >= cb.settings.HalfOpenMaxInFlights {
+				admitErr = ErrTooManyRequests
+				return next, nil
+			}
+
+		case StateClosed:
+			// always admitted
+		}
+
+		next.Counts.onRequest()
+		admitted = true
+		return next, nil
+	})
+
+	if storeErr != nil {
+		return Snapshot{}, storeErr
+	}
+
+	cb.fireStateChanges(stateChanges)
+
+	if !admitted {
+		// Return the snapshot we observed even on rejection so the
+		// caller (and the Observer) can see the real state that
+		// caused the rejection — typically StateOpen or StateHalfOpen.
+		// Returning the zero Snapshot here would surface a misleading
+		// "closed" state to OnRequest hooks.
+		return snap, admitErr
+	}
+	return snap, nil
+}
+
+// report applies the outcome of an admitted request to the breaker state.
+// generationAtAdmit is the generation that was current when the request was
+// admitted; if the breaker has since rotated to a new generation (via state
+// change or interval rollover), the outcome is discarded — it would be
+// counted against a stale window.
+func (cb *CircuitBreaker[T]) report(ctx context.Context, generationAtAdmit uint64, callErr error) error {
+	var stateChanges []stateChange
+
+	_, storeErr := cb.runUpdate(ctx, func(current Snapshot, now time.Time) (Snapshot, error) {
+		stateChanges = stateChanges[:0]
+
+		next := current
+		next = cb.advanceTime(next, now, &stateChanges)
+
+		// If the generation moved on while the request was in flight,
+		// the in-flight slot has already been reset by the rollover —
+		// just drop the outcome.
+		if next.Generation != generationAtAdmit {
+			return next, nil
+		}
+
+		switch {
+		case cb.settings.IsExcluded(callErr):
+			next.Counts.onExclusion()
+
+		case cb.settings.IsSuccessful(callErr):
+			next.Counts.onSuccess()
+			if next.State == StateHalfOpen && cb.settings.ReadyToClose(next.Counts) {
+				next = cb.transition(next, StateClosed, now, &stateChanges)
+			}
+
+		default:
+			next.Counts.onFailure()
+			switch next.State {
+			case StateClosed:
+				if cb.settings.ReadyToOpen(next.Counts) {
+					next = cb.transition(next, StateOpen, now, &stateChanges)
+				}
+			case StateHalfOpen:
+				if cb.settings.ReadyToReopen(next.Counts) {
+					next = cb.transition(next, StateOpen, now, &stateChanges)
+				}
+			}
+		}
+
+		return next, nil
+	})
+
+	// Only publish state changes if the underlying Update actually
+	// committed. Store implementations are allowed to invoke the closure
+	// (and therefore append to stateChanges) even on a path that
+	// ultimately returns an error — for example a CAS retry that exhausts
+	// its budget. Emitting OnStateChange on such a path would report
+	// transitions that were never persisted.
+	if storeErr == nil {
+		cb.fireStateChanges(stateChanges)
+	}
+	return storeErr
+}
+
+// stateChange records a transition that should be reported via OnStateChange
+// after the Store update completes. Counts is captured immediately before
+// the transition (i.e. the counts that triggered it), matching the v3 spec
+// proposed by sony but not yet shipped.
+type stateChange struct {
+	from   State
+	to     State
+	counts Counts
+}
+
+// advanceTime applies time-based transitions (open → half-open after
+// Timeout, closed → closed at Interval boundary). It does not perform
+// outcome-driven transitions; those are handled in report.
+func (cb *CircuitBreaker[T]) advanceTime(snap Snapshot, now time.Time, changes *[]stateChange) Snapshot {
+	switch snap.State {
 	case StateOpen:
-		if expiry.Before(now) {
-			currState = StateHalfOpen
-			cb.setState(state, StateHalfOpen, now)
+		if !snap.Expiry.IsZero() && !now.Before(snap.Expiry) {
+			snap = cb.transition(snap, StateHalfOpen, now, changes)
 		}
-	default:
+	case StateClosed:
+		if !snap.Expiry.IsZero() && !now.Before(snap.Expiry) {
+			// Closed → closed: just rotate the generation, do not
+			// fire OnStateChange (no actual state change).
+			snap.Generation++
+			snap.Counts.reset()
+			snap.GenerationStart = now
+			snap.Expiry = cb.closedExpiry(now)
+		}
 	}
-
-	return currState, cb.getGeneration()
+	return snap
 }
 
-func (cb *CircuitBreaker) setState(oldState, newState State, now time.Time) {
-	if oldState == newState {
+// transition records a state change in changes and returns a snapshot in the
+// new generation with reset Counts and recomputed Expiry.
+func (cb *CircuitBreaker[T]) transition(snap Snapshot, to State, now time.Time, changes *[]stateChange) Snapshot {
+	if snap.State == to {
+		return snap
+	}
+	*changes = append(*changes, stateChange{
+		from:   snap.State,
+		to:     to,
+		counts: snap.Counts,
+	})
+
+	snap.State = to
+	snap.Generation++
+	snap.Counts.reset()
+	snap.GenerationStart = now
+
+	switch to {
+	case StateClosed:
+		snap.Expiry = cb.closedExpiry(now)
+	case StateOpen:
+		snap.Expiry = now.Add(cb.settings.Timeout)
+	case StateHalfOpen:
+		snap.Expiry = time.Time{}
+	}
+	return snap
+}
+
+// closedExpiry returns the expiry for the closed state given now and
+// Settings.Interval. Zero Interval means "no expiry".
+func (cb *CircuitBreaker[T]) closedExpiry(now time.Time) time.Time {
+	if cb.settings.Interval <= 0 {
+		return time.Time{}
+	}
+	return now.Add(cb.settings.Interval)
+}
+
+// fireStateChanges invokes OnStateChange and Observer.OnStateChange for
+// each recorded transition. It is called after the Store Update completes
+// so callbacks run without the breaker (or the Store) holding any locks.
+// Callbacks are free to call back into cb.State / cb.Counts without
+// deadlocking — fixing sony/gobreaker #37.
+func (cb *CircuitBreaker[T]) fireStateChanges(changes []stateChange) {
+	if len(changes) == 0 {
 		return
 	}
-
-	prev := oldState
-	cb._setState(newState)
-
-	cb.toNewGeneration(now, nil, newState)
-
-	if cb.onStateChange != nil {
-		cb.onStateChange(cb.name, prev, newState)
+	for _, ch := range changes {
+		if cb.settings.OnStateChange != nil {
+			cb.settings.OnStateChange(cb.settings.Name, ch.from, ch.to, ch.counts)
+		}
+		if cb.settings.Observer != nil {
+			cb.settings.Observer.OnStateChange(cb.settings.Name, ch.from, ch.to, ch.counts)
+		}
 	}
 }
 
-func (cb *CircuitBreaker) toNewGeneration(now time.Time, expiry *time.Time, state State) {
-	//cb.generation++
-	cb.incrGeneration()
-	cb.counts.clear()
-
-	var newExpriry time.Time
-	var zero time.Time
-	switch state {
-	case StateClosed:
-		if cb.interval == 0 {
-			newExpriry = zero
-		} else {
-			newExpriry = now.Add(cb.interval)
-		}
-	case StateOpen:
-		if expiry == nil {
-			e := cb.getExpiry()
-			expiry = &e
-		}
-		if expiry.IsZero() {
-			newExpriry = now.Add(cb.timeout)
-		}
-	default: // StateHalfOpen
-		newExpriry = zero
+// loadSnapshot reads the current snapshot from the Store, transparently
+// falling back to the local store on Store error if the policy permits.
+func (cb *CircuitBreaker[T]) loadSnapshot(ctx context.Context) (Snapshot, error) {
+	snap, err := cb.store.Get(ctx, cb.settings.Name)
+	if err == nil {
+		return snap, nil
 	}
+	if cb.settings.OnStoreFailure == FailFast {
+		return Snapshot{}, fmt.Errorf("%w: %w", ErrStoreUnavailable, err)
+	}
+	return cb.localFallbackStore().Get(ctx, cb.settings.Name)
+}
 
-	cb.setExpiry(newExpriry)
+// runUpdate dispatches an UpdateFunc to the Store, transparently falling
+// back to the local store on Store error if the policy permits.
+func (cb *CircuitBreaker[T]) runUpdate(ctx context.Context, fn UpdateFunc) (Snapshot, error) {
+	snap, err := cb.store.Update(ctx, cb.settings.Name, fn)
+	if err == nil {
+		return snap, nil
+	}
+	if cb.settings.OnStoreFailure == FailFast {
+		return Snapshot{}, fmt.Errorf("%w: %w", ErrStoreUnavailable, err)
+	}
+	return cb.localFallbackStore().Update(ctx, cb.settings.Name, fn)
+}
+
+// localFallbackStore returns the lazily-allocated local fallback store.
+func (cb *CircuitBreaker[T]) localFallbackStore() *LocalStore {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	if cb.localFallback == nil {
+		cb.localFallback = NewLocalStore()
+	}
+	return cb.localFallback
+}
+
+// setClock replaces the breaker's clock function. Tests use it directly via
+// the package-internal helper. The replacement is also propagated to the
+// underlying LocalStore if there is one.
+func (cb *CircuitBreaker[T]) setClock(now func() time.Time) {
+	cb.now = now
+	if ls, ok := cb.store.(*LocalStore); ok {
+		ls.setClock(now)
+	}
 }

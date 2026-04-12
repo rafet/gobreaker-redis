@@ -1,132 +1,194 @@
-gobreaker
-=========
+# gobreaker-redis
 
-[![GoDoc](https://godoc.org/github.com/sony/gobreaker?status.svg)](https://godoc.org/github.com/sony/gobreaker)
+[![Go Reference](https://pkg.go.dev/badge/github.com/rafet/gobreaker-redis/v2.svg)](https://pkg.go.dev/github.com/rafet/gobreaker-redis/v2)
+[![Go Report Card](https://goreportcard.com/badge/github.com/rafet/gobreaker-redis)](https://goreportcard.com/report/github.com/rafet/gobreaker-redis)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-[gobreaker][repo-url] implements the [Circuit Breaker pattern](https://msdn.microsoft.com/en-us/library/dn589784.aspx) in Go.
+A distributed-first circuit breaker for Go. Built around three principles:
 
-Installation
-------------
+1. **Redis-backed shared state is a first-class concern**, not a bolt-on. The state machine is decoupled from persistence so a single CircuitBreaker behaves identically whether it runs alone or alongside hundreds of replicas sharing a Redis cluster.
+2. **Every state transition is customizable.** `ReadyToOpen`, `ReadyToClose`, and `ReadyToReopen` are three separate predicates instead of one ambiguous `MaxRequests` knob. The half-open phase is fully under user control.
+3. **Common pitfalls are fixed by design, not by documentation.** Deadlocks in `OnStateChange`, lost counts on transition, ambiguous half-open semantics, in-flight tracking, panic safety, and silent Redis failures are all handled at the type level.
 
+The package is a deliberate alternative to [sony/gobreaker](https://github.com/sony/gobreaker). It draws on the same conceptual model — the canonical Closed/Half-Open/Open state machine from Michael Nygard's *Release It!* — but rebuilds the API around problems the sony issue tracker has been collecting for years (see [DESIGN.md](docs/DESIGN.md) for the receipts).
+
+## Installation
+
+```bash
+go get github.com/rafet/gobreaker-redis/v2
 ```
-go get github.com/rafet/gobreaker-redis
-```
 
-Usage
------
+Requires Go 1.22+.
 
-The struct `CircuitBreaker` is a state machine to prevent sending requests that are likely to fail.
-The function `NewCircuitBreaker` creates a new `CircuitBreaker`.
+## Quick start
 
 ```go
-func NewCircuitBreaker(st Settings) *CircuitBreaker
-```
+package main
 
-You can configure `CircuitBreaker` by the struct `Settings`:
+import (
+    "context"
+    "log"
+    "net/http"
+    "time"
 
-```go
-type Settings struct {
-	Name          string
-	MaxRequests   uint32
-	Interval      time.Duration
-	Timeout       time.Duration
-	ReadyToTrip   func(counts Counts) bool
-	OnStateChange func(name string, from State, to State)
-	IsSuccessful  func(err error) bool
+    gobreaker "github.com/rafet/gobreaker-redis/v2"
+)
+
+func main() {
+    ctx := context.Background()
+
+    cb, err := gobreaker.New[*http.Response](ctx, gobreaker.Settings{
+        Name:    "user-service",
+        Timeout: 30 * time.Second,
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.example.com/users/1", http.NoBody)
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    resp, err := cb.Execute(ctx, func(ctx context.Context) (*http.Response, error) {
+        return http.DefaultClient.Do(req.WithContext(ctx))
+    })
+    if err != nil {
+        log.Printf("call failed: %v", err)
+        return
+    }
+    defer resp.Body.Close()
 }
 ```
 
-- `Name` is the name of the `CircuitBreaker`.
-
-- `MaxRequests` is the maximum number of requests allowed to pass through
-  when the `CircuitBreaker` is half-open.
-  If `MaxRequests` is 0, `CircuitBreaker` allows only 1 request.
-
-- `Interval` is the cyclic period of the closed state
-  for `CircuitBreaker` to clear the internal `Counts`, described later in this section.
-  If `Interval` is 0, `CircuitBreaker` doesn't clear the internal `Counts` during the closed state.
-
-- `Timeout` is the period of the open state,
-  after which the state of `CircuitBreaker` becomes half-open.
-  If `Timeout` is 0, the timeout value of `CircuitBreaker` is set to 60 seconds.
-
-- `ReadyToTrip` is called with a copy of `Counts` whenever a request fails in the closed state.
-  If `ReadyToTrip` returns true, `CircuitBreaker` will be placed into the open state.
-  If `ReadyToTrip` is `nil`, default `ReadyToTrip` is used.
-  Default `ReadyToTrip` returns true when the number of consecutive failures is more than 5.
-
-- `OnStateChange` is called whenever the state of `CircuitBreaker` changes.
-
-- `IsSuccessful` is called with the error returned from a request.
-  If `IsSuccessful` returns true, the error is counted as a success.
-  Otherwise the error is counted as a failure.
-  If `IsSuccessful` is nil, default `IsSuccessful` is used, which returns false for all non-nil errors.
-
-The struct `Counts` holds the numbers of requests and their successes/failures:
+This gives you a single-process breaker backed by an in-memory `LocalStore`. To turn it into a distributed breaker shared across replicas, swap one line:
 
 ```go
-type Counts struct {
-	Requests             uint32
-	TotalSuccesses       uint32
-	TotalFailures        uint32
-	ConsecutiveSuccesses uint32
-	ConsecutiveFailures  uint32
-}
+import "github.com/rafet/gobreaker-redis/v2/respstore"
+
+store := respstore.New(redis.NewClient(&redis.Options{Addr: "localhost:6379"}))
+
+cb, err := gobreaker.New[*http.Response](ctx, gobreaker.Settings{
+    Name:    "user-service",
+    Store:   store,    // <-- only change
+    Timeout: 30 * time.Second,
+})
 ```
 
-`CircuitBreaker` clears the internal `Counts` either
-on the change of the state or at the closed-state intervals.
-`Counts` ignores the results of the requests sent before clearing.
+The same code now coordinates state across every process that talks to the same Redis (or Valkey, or KeyDB, or DragonflyDB — see [BACKENDS.md](docs/BACKENDS.md)).
 
-`CircuitBreaker` can wrap any function to send a request:
+## What's in the box
 
-```go
-func (cb *CircuitBreaker) Execute(req func() (interface{}, error)) (interface{}, error)
-```
+| Feature | Where |
+|---|---|
+| Generic `CircuitBreaker[T]` with `context.Context` first | `gobreaker.go` |
+| `ReadyToOpen` / `ReadyToClose` / `ReadyToReopen` predicates | `readyto.go`, `settings.go` |
+| `Counts` with `InFlights`, `TotalExclusions`, consecutive counters | `counts.go` |
+| `IsExcluded` for neutral outcomes (e.g. context cancellation) | `settings.go` |
+| Deadlock-safe `OnStateChange(name, from, to, counts)` | `gobreaker.go` |
+| Atomic Lua-CAS Redis store, no distributed lock | `respstore/` |
+| `LocalStore` for tests and single-process apps | `localstore.go` |
+| `Group` for per-key / per-tenant breakers | `group.go` |
+| `ExecuteWithFallback` and `OnOpenOnly` helpers | `fallback.go` |
+| `httpcb.OnlyServerErrors`, `RetryableStatuses`, `StatusInRange` | `httpcb/` |
+| `Observer` interface for metrics/tracing | `observer.go` |
+| `OnStoreFailure: FallbackToLocal` for Redis outage survival | `settings.go` |
 
-The method `Execute` runs the given request if `CircuitBreaker` accepts it.
-`Execute` returns an error instantly if `CircuitBreaker` rejects the request.
-Otherwise, `Execute` returns the result of the request.
-If a panic occurs in the request, `CircuitBreaker` handles it as an error
-and causes the same panic again.
+## Examples
 
-Example
--------
+| Example | What it shows |
+|---|---|
+| [`example/basic`](example/basic) | Smallest possible breaker, in-memory |
+| [`example/redis`](example/redis) | Redis-backed breaker, single instance |
+| [`example/distributed`](example/distributed) | Two breaker instances sharing Redis state |
+| [`example/group`](example/group) | Per-tenant breakers via `Group` |
+| [`example/http`](example/http) | HTTP client with `httpcb.OnlyServerErrors` |
+| [`example/fallback`](example/fallback) | Cached fallback via `ExecuteWithFallback` |
 
-```go
-var cb *breaker.CircuitBreaker
+## Performance
 
-func Get(url string) ([]byte, error) {
-	body, err := cb.Execute(func() (interface{}, error) {
-		resp, err := http.Get(url)
-		if err != nil {
-			return nil, err
-		}
+Benchmarked against 7 other Go circuit breaker libraries on identical no-op workloads (Apple M4 Pro, Go 1.24). Full methodology and commentary in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
-		defer resp.Body.Close()
-		body, err := ioutil.ReadAll(resp.Body)
-		if err != nil {
-			return nil, err
-		}
+| Library | Closed Success | Open Reject | Closed Parallel | Allocs |
+|---|---:|---:|---:|---:|
+| mercari/go-circuitbreaker | 10.6 ns | 8.9 ns | 70.9 ns | 0 |
+| **rafet/gobreaker-redis (us)** | **72.5 ns** | **42.8 ns** | **249 ns** | **0** |
+| sony/gobreaker v1 | 72.7 ns | 35.8 ns | 241 ns | 0 |
+| sony/gobreaker v2 | 73.9 ns | 36.0 ns | 241 ns | 0 |
+| rubyist/circuitbreaker | 76.7 ns | 68.1 ns | 305 ns | 0 |
+| cep21/circuit v4 | 246.8 ns | 73.1 ns | 176 ns | 3-6 |
+| exaring/hoglet | 356.6 ns | 42.4 ns | 343 ns | 1-5 |
+| failsafe-go | 223.4 ns | 193.5 ns | 387 ns | 13-16 |
 
-		return body, nil
-	})
-	if err != nil {
-		return nil, err
-	}
+We are **tied with sony/gobreaker** on the success path (72.5 vs 72.7 ns) with zero heap allocations. Mercari is 7x faster because it uses atomic counters exclusively and trades away the Store interface, per-key Group, Observer, and customizable transitions. For the other 99% of workloads where the protected call takes microseconds, the difference is invisible.
 
-	return body.([]byte), nil
-}
-```
+### Feature comparison
 
-See [example](https://github.com/sony/gobreaker/blob/master/example) for details.
+| Feature | gobreaker-redis | sony v1 | sony v2 | mercari | cep21 | failsafe-go | hoglet | rubyist |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| Generics (`CircuitBreaker[T]`) | ✅ | - | ✅ | - | - | ✅ | ✅ | - |
+| `context.Context` first | ✅ | - | - | ✅ | ✅ | ✅ | ✅ | - |
+| Distributed (Redis-backed) | ✅ | - | ✅ | - | - | - | - | - |
+| Multiple backend support (Valkey, KeyDB, Dragonfly) | ✅ | - | - | - | - | - | - | - |
+| Redis outage fallback (`FallbackToLocal`) | ✅ | - | - | - | - | - | - | - |
+| Customizable transitions (`ReadyToOpen/Close/Reopen`) | ✅ | - | - | - | ✅ | - | - | - |
+| Half-open admission control (`HalfOpenMaxInFlights`) | ✅ | ✅ | ✅ | ✅ | - | ✅ | - | - |
+| `ExecuteWithFallback` | ✅ | - | - | - | ✅ | ✅ | - | - |
+| Per-key / per-tenant breakers (`Group`) | ✅ | - | - | - | ✅ | - | - | - |
+| Observer / metrics interface | ✅ | - | - | - | ✅ | ✅ | - | - |
+| `IsExcluded` for neutral outcomes | ✅ | - | ✅ | ✅ | - | - | ✅ | - |
+| HTTP status presets (`httpcb`) | ✅ | - | - | - | - | - | - | - |
+| Deadlock-safe `OnStateChange` | ✅ | - | - | ✅ | ✅ | ✅ | - | - |
+| Pre-transition Counts in callback | ✅ | - | - | - | - | - | - | - |
+| `InFlights` counter | ✅ | - | - | - | ✅ | - | - | - |
+| Sliding window | - | - | ✅ | - | ✅ | ✅ | ✅ | - |
+| Retry / Bulkhead / Rate limit | - | - | - | - | - | ✅ | - | - |
+| Zero alloc hot path | ✅ | ✅ | ✅ | ✅ | - | - | - | ✅ |
+| Panic safety | ✅ | ✅ | ✅ | - | - | - | - | - |
 
-License
--------
+**Key takeaway**: gobreaker-redis is the only library that combines distributed state (Redis/Valkey/KeyDB/Dragonfly), fully customizable transitions, per-key grouping, fallback, observability, AND zero-allocation performance. Sony v2 has distributed support but uses redsync (lock-based, more round-trips) and lacks transition customization, per-key groups, and fallback. Mercari is faster but single-process only. failsafe-go is broader (retry, bulkhead, rate limit) but significantly slower and single-process only.
 
-The MIT License (MIT)
+## Why another circuit breaker?
 
-See [LICENSE](https://github.com/sony/gobreaker/blob/master/LICENSE) for details.
+If you only need single-process breakers and your team already runs sony/gobreaker, **keep using it**. It's well-known, simple, and battle-tested for that use case.
 
+This package exists because the sony issue tracker has accumulated a class of problems that don't have clean solutions inside its design:
 
-[repo-url]: https://github.com/sony/gobreaker
+| Problem | sony issue | Our answer |
+|---|---|---|
+| `OnStateChange` deadlocks if you call `cb.Counts()` from inside | [#37](https://github.com/sony/gobreaker/issues/37) (open since 2020) | `OnStateChange` runs without the lock; `cb.Counts()` from inside is safe |
+| `Counts` is reset on state change, last-known counts are lost | [#72](https://github.com/sony/gobreaker/issues/72) | `OnStateChange(name, from, to, counts)` receives pre-transition counts |
+| `MaxRequests` ambiguity, `ErrTooManyRequests` confusion | [#30](https://github.com/sony/gobreaker/issues/30), [#49](https://github.com/sony/gobreaker/issues/49), [#53](https://github.com/sony/gobreaker/issues/53) | `MaxRequests` removed. `HalfOpenMaxInFlights` (admission cap) is separate from `ReadyToClose` (success threshold) |
+| Half-open success criteria not customizable | [#63](https://github.com/sony/gobreaker/issues/63) | `ReadyToClose` and `ReadyToReopen` are first-class predicates |
+| Slow upstream requests don't trip the breaker | [#91](https://github.com/sony/gobreaker/issues/91) | `Counts.InFlights` exposed; user predicates can react to in-flight pressure |
+| No fallback function | [#22](https://github.com/sony/gobreaker/issues/22) | `ExecuteWithFallback` + `OnOpenOnly` helper |
+| No HTTP-specific helpers | [#46](https://github.com/sony/gobreaker/issues/46) | `httpcb` package with `OnlyServerErrors`, `RetryableStatuses`, `StatusInRange` |
+| Per-host / per-tenant breakers require user-managed maps | [#43](https://github.com/sony/gobreaker/issues/43), [#19](https://github.com/sony/gobreaker/issues/19) | `Group` with `PerKeySettings` and `KeyToName` |
+| Context cancellation poisons counters | [#105](https://github.com/sony/gobreaker/issues/105) | `IsExcluded` + `IgnoreContextErrors` helper |
+| Distributed implementation uses redsync (lock-based) | sony/v2/redis | We use Lua-CAS — no lock, single round-trip on uncontended writes |
+| Redis outage = silent failure or panic | sony/v2/redis | `OnStoreFailure: FallbackToLocal` keeps the breaker working in-process while Redis recovers |
+
+See [docs/DESIGN.md](docs/DESIGN.md) for the long-form rationale.
+
+## Backend compatibility
+
+`respstore` uses `redis/go-redis/v9`'s `UniversalClient` interface. Anything that speaks the Redis protocol works with no code changes:
+
+- Redis 6+, Redis Cluster, Redis Sentinel
+- Valkey 7+ (single + cluster)
+- KeyDB 6+ (single + cluster)
+- DragonflyDB 1.0+
+- AWS ElastiCache, MemoryDB
+- Upstash, Redis Cloud, Aiven, ScaleGrid
+
+See [docs/BACKENDS.md](docs/BACKENDS.md) for the matrix and configuration recipes.
+
+## History and migration
+
+This package was originally a Redis-backed circuit breaker built on a fork of sony/gobreaker (Jan 2024). In late 2024 sony introduced its own `DistributedCircuitBreaker`, and in Aug 2025 they shipped a `redis` sub-module on top of redsync. With v2, this library re-emerges as an opinionated alternative: same problem space, different design choices, fewer footguns.
+
+If you used the original `github.com/rafet/gobreaker-redis` (pre-v2), see [docs/MIGRATION.md](docs/MIGRATION.md). v2 is a complete rewrite and is **not** API-compatible.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

@@ -1,0 +1,43 @@
+# 2026/04/12 02:36:08.572386 [TestProperty_Codec_RoundTripThroughStore] [rapid] draw state: 0
+# 2026/04/12 02:36:08.572401 [TestProperty_Codec_RoundTripThroughStore] [rapid] draw gs: 0
+# 2026/04/12 02:36:08.572410 [TestProperty_Codec_RoundTripThroughStore] [rapid] draw ex: 0
+# 2026/04/12 02:36:08.572418 [TestProperty_Codec_RoundTripThroughStore] [rapid] draw gsZero: true
+# 2026/04/12 02:36:08.572422 [TestProperty_Codec_RoundTripThroughStore] [rapid] draw exZero: false
+# 2026/04/12 02:36:08.572428 [TestProperty_Codec_RoundTripThroughStore] [rapid] draw gen: 0x0
+# 2026/04/12 02:36:08.572434 [TestProperty_Codec_RoundTripThroughStore] [rapid] draw req: 0x0
+# 2026/04/12 02:36:08.572439 [TestProperty_Codec_RoundTripThroughStore] [rapid] draw inf: 0x0
+# 2026/04/12 02:36:08.572444 [TestProperty_Codec_RoundTripThroughStore] [rapid] draw succ: 0x0
+# 2026/04/12 02:36:08.572451 [TestProperty_Codec_RoundTripThroughStore] [rapid] draw fail: 0x0
+# 2026/04/12 02:36:08.572455 [TestProperty_Codec_RoundTripThroughStore] [rapid] draw excl: 0x0
+# 2026/04/12 02:36:08.572459 [TestProperty_Codec_RoundTripThroughStore] [rapid] draw csucc: 0x0
+# 2026/04/12 02:36:08.572463 [TestProperty_Codec_RoundTripThroughStore] [rapid] draw cfail: 0x0
+# 2026/04/12 02:36:08.573773 [TestProperty_Codec_RoundTripThroughStore] Expiry: 0001-01-01 00:00:00 +0000 UTC vs 1970-01-01 02:00:00 +0200 EET
+# 
+v0.4.8#10297012640169564086
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x1
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0

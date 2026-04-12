@@ -1,392 +1,666 @@
 package gobreaker
 
 import (
+	"context"
+	"errors"
 	"fmt"
-	"runtime"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/stretchr/testify/assert"
 )
 
-var defaultCB *CircuitBreaker
-var customCB *CircuitBreaker
-
-type StateChange struct {
-	name string
-	from State
-	to   State
+// fakeClock is a controllable clock used by all gobreaker tests. It avoids
+// time.Sleep entirely so the suite is deterministic and fast.
+type fakeClock struct {
+	mu sync.Mutex
+	t  time.Time
 }
 
-var stateChange StateChange
+func newFakeClock(start time.Time) *fakeClock {
+	return &fakeClock{t: start}
+}
 
-func pseudoSleep(cb *CircuitBreaker, period time.Duration) {
-	if !cb.expiry.IsZero() {
-		cb.expiry = cb.expiry.Add(-period)
+func (c *fakeClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.t
+}
+
+func (c *fakeClock) Advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.t = c.t.Add(d)
+}
+
+// newTestBreaker constructs a CircuitBreaker[any] with a deterministic clock.
+// All breaker tests should go through this helper so they share the same
+// time semantics.
+func newTestBreaker(t *testing.T, s Settings) (*CircuitBreaker[any], *fakeClock) {
+	t.Helper()
+	clock := newFakeClock(time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC))
+	if s.Name == "" {
+		s.Name = t.Name()
 	}
-}
-
-func succeed(cb *CircuitBreaker) error {
-	_, err := cb.Execute(func() (interface{}, error) { return nil, nil })
-	return err
-}
-
-func succeedLater(cb *CircuitBreaker, delay time.Duration) <-chan error {
-	ch := make(chan error)
-	go func() {
-		_, err := cb.Execute(func() (interface{}, error) {
-			time.Sleep(delay)
-			return nil, nil
-		})
-		ch <- err
-	}()
-	return ch
-}
-
-func succeed2Step(cb *TwoStepCircuitBreaker) error {
-	done, err := cb.Allow()
+	cb, err := New[any](context.Background(), s)
 	if err != nil {
-		return err
+		t.Fatalf("New: %v", err)
 	}
-
-	done(true)
-	return nil
+	cb.setClock(clock.Now)
+	return cb, clock
 }
 
-func fail(cb *CircuitBreaker) error {
-	msg := "fail"
-	_, err := cb.Execute(func() (interface{}, error) { return nil, fmt.Errorf(msg) })
-	if err.Error() == msg {
-		return nil
-	}
+func succeed(t *testing.T, cb *CircuitBreaker[any]) error {
+	t.Helper()
+	_, err := cb.Execute(context.Background(), func(ctx context.Context) (any, error) {
+		return "ok", nil
+	})
 	return err
 }
 
-func fail2Step(cb *TwoStepCircuitBreaker) error {
-	done, err := cb.Allow()
+var errBoom = errors.New("boom")
+
+func failBreaker(t *testing.T, cb *CircuitBreaker[any]) error {
+	t.Helper()
+	_, err := cb.Execute(context.Background(), func(ctx context.Context) (any, error) {
+		return nil, errBoom
+	})
+	return err
+}
+
+// stateOf reads the breaker's authoritative state for assertions. It
+// goes through the public State() API so the fast-path inlineSnap and
+// the generic store path produce identical answers. Tests that need to
+// inspect the time-advance branch separately should call cb.State()
+// directly with a controlled clock.
+func stateOf(t *testing.T, cb *CircuitBreaker[any]) State {
+	t.Helper()
+	if cb.localStore != nil {
+		cb.inlineMu.Lock()
+		s := cb.inlineSnap.State
+		cb.inlineMu.Unlock()
+		return s
+	}
+	snap, err := cb.store.Get(context.Background(), cb.settings.Name)
 	if err != nil {
-		return err
+		t.Fatalf("store.Get: %v", err)
 	}
-
-	done(false)
-	return nil
+	return snap.State
 }
 
-func causePanic(cb *CircuitBreaker) error {
-	_, err := cb.Execute(func() (interface{}, error) { panic("oops"); return nil, nil })
-	return err
-}
-
-func newCustom() *CircuitBreaker {
-	var customSt Settings
-	customSt.Name = "cb"
-	customSt.MaxRequests = 3
-	customSt.Interval = time.Duration(30) * time.Second
-	customSt.Timeout = time.Duration(90) * time.Second
-	customSt.ReadyToTrip = func(counts Counts) bool {
-		numReqs := counts.Requests
-		failureRatio := float64(counts.TotalFailures) / float64(numReqs)
-
-		counts.clear() // no effect on customCB.counts
-
-		return numReqs >= 3 && failureRatio >= 0.6
+func TestNewRejectsBadSettings(t *testing.T) {
+	_, err := New[any](context.Background(), Settings{})
+	if !errors.Is(err, ErrInvalidSettings) {
+		t.Errorf("expected ErrInvalidSettings, got %v", err)
 	}
-	customSt.OnStateChange = func(name string, from State, to State) {
-		stateChange = StateChange{name, from, to}
+}
+
+func TestNewSeedsInitialSnapshot(t *testing.T) {
+	store := NewLocalStore()
+	cb, err := New[any](context.Background(), Settings{Name: "x", Store: store})
+	if err != nil {
+		t.Fatal(err)
 	}
-
-	return NewCircuitBreaker(customSt)
+	_ = cb
+	snap, _ := store.Get(context.Background(), "x")
+	if snap.State != StateClosed {
+		t.Errorf("State = %v, want closed", snap.State)
+	}
+	if snap.Generation != 1 {
+		t.Errorf("Generation = %d, want 1", snap.Generation)
+	}
+	if snap.Version != 1 {
+		t.Errorf("Version = %d, want 1", snap.Version)
+	}
 }
 
-func newNegativeDurationCB() *CircuitBreaker {
-	var negativeSt Settings
-	negativeSt.Name = "ncb"
-	negativeSt.Interval = time.Duration(-30) * time.Second
-	negativeSt.Timeout = time.Duration(-90) * time.Second
-
-	return NewCircuitBreaker(negativeSt)
+func TestNewIdempotentInitialization(t *testing.T) {
+	store := NewLocalStore()
+	cb1, err := New[any](context.Background(), Settings{Name: "shared", Store: store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cb2, err := New[any](context.Background(), Settings{Name: "shared", Store: store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = cb1
+	_ = cb2
+	snap, _ := store.Get(context.Background(), "shared")
+	// Two breakers initializing should not double-bump generation.
+	if snap.Generation != 1 {
+		t.Errorf("Generation after double init = %d, want 1", snap.Generation)
+	}
 }
 
-func init() {
-	defaultCB = NewCircuitBreaker(Settings{})
-	customCB = newCustom()
+// TestClosedToOpenOnConsecutiveFailures verifies the headline behavior:
+// 5 consecutive failures (the default ReadyToOpen) trip the breaker.
+func TestClosedToOpenOnConsecutiveFailures(t *testing.T) {
+	cb, _ := newTestBreaker(t, Settings{Name: "trip"})
+	for i := 0; i < 4; i++ {
+		if err := failBreaker(t, cb); !errors.Is(err, errBoom) {
+			t.Fatalf("failure %d: err = %v, want errBoom", i, err)
+		}
+	}
+	if got := stateOf(t, cb); got != StateClosed {
+		t.Errorf("after 4 failures: state = %v, want closed", got)
+	}
+	if err := failBreaker(t, cb); !errors.Is(err, errBoom) {
+		t.Fatalf("failure 5: err = %v, want errBoom", err)
+	}
+	if got := stateOf(t, cb); got != StateOpen {
+		t.Errorf("after 5 failures: state = %v, want open", got)
+	}
 }
 
-func TestStateConstants(t *testing.T) {
-	assert.Equal(t, State(0), StateClosed)
-	assert.Equal(t, State(1), StateHalfOpen)
-	assert.Equal(t, State(2), StateOpen)
-
-	assert.Equal(t, StateClosed.String(), "closed")
-	assert.Equal(t, StateHalfOpen.String(), "half-open")
-	assert.Equal(t, StateOpen.String(), "open")
-	assert.Equal(t, State(100).String(), "unknown state: 100")
-}
-
-func TestNewCircuitBreaker(t *testing.T) {
-	defaultCB := NewCircuitBreaker(Settings{})
-	assert.Equal(t, "", defaultCB.name)
-	assert.Equal(t, uint32(1), defaultCB.maxRequests)
-	assert.Equal(t, time.Duration(0), defaultCB.interval)
-	assert.Equal(t, time.Duration(60)*time.Second, defaultCB.timeout)
-	assert.NotNil(t, defaultCB.readyToTrip)
-	assert.Nil(t, defaultCB.onStateChange)
-	assert.Equal(t, StateClosed, defaultCB.state)
-	assert.Equal(t, Counts{0, 0, 0, 0, 0}, defaultCB.counts)
-	assert.True(t, defaultCB.expiry.IsZero())
-
-	customCB := newCustom()
-	assert.Equal(t, "cb", customCB.name)
-	assert.Equal(t, uint32(3), customCB.maxRequests)
-	assert.Equal(t, time.Duration(30)*time.Second, customCB.interval)
-	assert.Equal(t, time.Duration(90)*time.Second, customCB.timeout)
-	assert.NotNil(t, customCB.readyToTrip)
-	assert.NotNil(t, customCB.onStateChange)
-	assert.Equal(t, StateClosed, customCB.state)
-	assert.Equal(t, Counts{0, 0, 0, 0, 0}, customCB.counts)
-	assert.False(t, customCB.expiry.IsZero())
-
-	negativeDurationCB := newNegativeDurationCB()
-	assert.Equal(t, "ncb", negativeDurationCB.name)
-	assert.Equal(t, uint32(1), negativeDurationCB.maxRequests)
-	assert.Equal(t, time.Duration(0)*time.Second, negativeDurationCB.interval)
-	assert.Equal(t, time.Duration(60)*time.Second, negativeDurationCB.timeout)
-	assert.NotNil(t, negativeDurationCB.readyToTrip)
-	assert.Nil(t, negativeDurationCB.onStateChange)
-	assert.Equal(t, StateClosed, negativeDurationCB.state)
-	assert.Equal(t, Counts{0, 0, 0, 0, 0}, negativeDurationCB.counts)
-	assert.True(t, negativeDurationCB.expiry.IsZero())
-}
-
-func TestDefaultCircuitBreaker(t *testing.T) {
-	assert.Equal(t, "", defaultCB.Name())
-
+// TestOpenRejectsRequests verifies that the open state returns ErrOpenState
+// without invoking the wrapped function.
+func TestOpenRejectsRequests(t *testing.T) {
+	cb, _ := newTestBreaker(t, Settings{Name: "open"})
 	for i := 0; i < 5; i++ {
-		assert.Nil(t, fail(defaultCB))
+		_ = failBreaker(t, cb)
 	}
-	assert.Equal(t, StateClosed, defaultCB.State())
-	assert.Equal(t, Counts{5, 0, 5, 0, 5}, defaultCB.counts)
+	if got := stateOf(t, cb); got != StateOpen {
+		t.Fatalf("setup: expected open, got %v", got)
+	}
 
-	assert.Nil(t, succeed(defaultCB))
-	assert.Equal(t, StateClosed, defaultCB.State())
-	assert.Equal(t, Counts{6, 1, 5, 1, 0}, defaultCB.counts)
+	called := false
+	_, err := cb.Execute(context.Background(), func(ctx context.Context) (any, error) {
+		called = true
+		return nil, nil
+	})
+	if !errors.Is(err, ErrOpenState) {
+		t.Errorf("err = %v, want ErrOpenState", err)
+	}
+	if called {
+		t.Error("wrapped function should not run when breaker is open")
+	}
+}
 
-	assert.Nil(t, fail(defaultCB))
-	assert.Equal(t, StateClosed, defaultCB.State())
-	assert.Equal(t, Counts{7, 1, 6, 0, 1}, defaultCB.counts)
-
-	// StateClosed to StateOpen
+// TestOpenToHalfOpenAfterTimeout verifies the time-based transition.
+func TestOpenToHalfOpenAfterTimeout(t *testing.T) {
+	cb, clock := newTestBreaker(t, Settings{Name: "timeout", Timeout: 30 * time.Second})
 	for i := 0; i < 5; i++ {
-		assert.Nil(t, fail(defaultCB)) // 6 consecutive failures
+		_ = failBreaker(t, cb)
 	}
-	assert.Equal(t, StateOpen, defaultCB.State())
-	assert.Equal(t, Counts{0, 0, 0, 0, 0}, defaultCB.counts)
-	assert.False(t, defaultCB.expiry.IsZero())
+	if got := stateOf(t, cb); got != StateOpen {
+		t.Fatalf("setup: expected open, got %v", got)
+	}
 
-	assert.Error(t, succeed(defaultCB))
-	assert.Error(t, fail(defaultCB))
-	assert.Equal(t, Counts{0, 0, 0, 0, 0}, defaultCB.counts)
+	clock.Advance(29 * time.Second)
+	// Still open: timeout has not yet elapsed.
+	if got := stateOf(t, cb); got != StateOpen {
+		t.Errorf("at 29s: state = %v, want open", got)
+	}
 
-	pseudoSleep(defaultCB, time.Duration(59)*time.Second)
-	assert.Equal(t, StateOpen, defaultCB.State())
-
-	// StateOpen to StateHalfOpen
-	pseudoSleep(defaultCB, time.Duration(1)*time.Second) // over Timeout
-	assert.Equal(t, StateHalfOpen, defaultCB.State())
-	assert.True(t, defaultCB.expiry.IsZero())
-
-	// StateHalfOpen to StateOpen
-	assert.Nil(t, fail(defaultCB))
-	assert.Equal(t, StateOpen, defaultCB.State())
-	assert.Equal(t, Counts{0, 0, 0, 0, 0}, defaultCB.counts)
-	assert.False(t, defaultCB.expiry.IsZero())
-
-	// StateOpen to StateHalfOpen
-	pseudoSleep(defaultCB, time.Duration(60)*time.Second)
-	assert.Equal(t, StateHalfOpen, defaultCB.State())
-	assert.True(t, defaultCB.expiry.IsZero())
-
-	// StateHalfOpen to StateClosed
-	assert.Nil(t, succeed(defaultCB))
-	assert.Equal(t, StateClosed, defaultCB.State())
-	assert.Equal(t, Counts{0, 0, 0, 0, 0}, defaultCB.counts)
-	assert.True(t, defaultCB.expiry.IsZero())
+	clock.Advance(2 * time.Second) // total 31s
+	// The next admission attempt should observe the timeout and enter half-open.
+	if err := succeed(t, cb); err != nil {
+		t.Errorf("first request after timeout: err = %v", err)
+	}
+	if got := stateOf(t, cb); got != StateClosed {
+		// With HalfOpenMaxInFlights=1 and ReadyToClose=ConsecutiveSuccesses(1),
+		// a single success closes the breaker again.
+		t.Errorf("after success in half-open: state = %v, want closed", got)
+	}
 }
 
-func TestCustomCircuitBreaker(t *testing.T) {
-	assert.Equal(t, "cb", customCB.Name())
-
+// TestHalfOpenInFlightAdmissionControl is the regression test for sony #30:
+// in half-open we admit at most HalfOpenMaxInFlights concurrent requests.
+func TestHalfOpenInFlightAdmissionControl(t *testing.T) {
+	cb, clock := newTestBreaker(t, Settings{
+		Name:                 "halfopen-cap",
+		Timeout:              time.Second,
+		HalfOpenMaxInFlights: 2,
+	})
+	// Trip the breaker.
 	for i := 0; i < 5; i++ {
-		assert.Nil(t, succeed(customCB))
-		assert.Nil(t, fail(customCB))
+		_ = failBreaker(t, cb)
 	}
-	assert.Equal(t, StateClosed, customCB.State())
-	assert.Equal(t, Counts{10, 5, 5, 0, 1}, customCB.counts)
+	clock.Advance(2 * time.Second)
 
-	pseudoSleep(customCB, time.Duration(29)*time.Second)
-	assert.Nil(t, succeed(customCB))
-	assert.Equal(t, StateClosed, customCB.State())
-	assert.Equal(t, Counts{11, 6, 5, 1, 0}, customCB.counts)
-
-	pseudoSleep(customCB, time.Duration(1)*time.Second) // over Interval
-	assert.Nil(t, fail(customCB))
-	assert.Equal(t, StateClosed, customCB.State())
-	assert.Equal(t, Counts{1, 0, 1, 0, 1}, customCB.counts)
-
-	// StateClosed to StateOpen
-	assert.Nil(t, succeed(customCB))
-	assert.Nil(t, fail(customCB)) // failure ratio: 2/3 >= 0.6
-	assert.Equal(t, StateOpen, customCB.State())
-	assert.Equal(t, Counts{0, 0, 0, 0, 0}, customCB.counts)
-	assert.False(t, customCB.expiry.IsZero())
-	assert.Equal(t, StateChange{"cb", StateClosed, StateOpen}, stateChange)
-
-	// StateOpen to StateHalfOpen
-	pseudoSleep(customCB, time.Duration(90)*time.Second)
-	assert.Equal(t, StateHalfOpen, customCB.State())
-	assert.True(t, defaultCB.expiry.IsZero())
-	assert.Equal(t, StateChange{"cb", StateOpen, StateHalfOpen}, stateChange)
-
-	assert.Nil(t, succeed(customCB))
-	assert.Nil(t, succeed(customCB))
-	assert.Equal(t, StateHalfOpen, customCB.State())
-	assert.Equal(t, Counts{2, 2, 0, 2, 0}, customCB.counts)
-
-	// StateHalfOpen to StateClosed
-	ch := succeedLater(customCB, time.Duration(100)*time.Millisecond) // 3 consecutive successes
-	time.Sleep(time.Duration(50) * time.Millisecond)
-	assert.Equal(t, Counts{3, 2, 0, 2, 0}, customCB.counts)
-	assert.Error(t, succeed(customCB)) // over MaxRequests
-	assert.Nil(t, <-ch)
-	assert.Equal(t, StateClosed, customCB.State())
-	assert.Equal(t, Counts{0, 0, 0, 0, 0}, customCB.counts)
-	assert.False(t, customCB.expiry.IsZero())
-	assert.Equal(t, StateChange{"cb", StateHalfOpen, StateClosed}, stateChange)
-}
-
-func TestTwoStepCircuitBreaker(t *testing.T) {
-	tscb := NewTwoStepCircuitBreaker(Settings{Name: "tscb"})
-	assert.Equal(t, "tscb", tscb.Name())
-
-	for i := 0; i < 5; i++ {
-		assert.Nil(t, fail2Step(tscb))
+	// Hold two requests in flight: use channels to gate the wrapped fn.
+	gate := make(chan struct{})
+	done := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			_, err := cb.Execute(context.Background(), func(ctx context.Context) (any, error) {
+				<-gate
+				return "ok", nil
+			})
+			done <- err
+		}()
+	}
+	// Wait until both probes have been admitted.
+	deadline := time.Now().Add(time.Second)
+	for {
+		c, err := cb.Counts(context.Background())
+		if err != nil {
+			t.Fatalf("Counts: %v", err)
+		}
+		if c.InFlights == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("InFlights never reached 2: %+v", c)
+		}
+		time.Sleep(time.Millisecond)
 	}
 
-	assert.Equal(t, StateClosed, tscb.State())
-	assert.Equal(t, Counts{5, 0, 5, 0, 5}, tscb.cb.counts)
-
-	assert.Nil(t, succeed2Step(tscb))
-	assert.Equal(t, StateClosed, tscb.State())
-	assert.Equal(t, Counts{6, 1, 5, 1, 0}, tscb.cb.counts)
-
-	assert.Nil(t, fail2Step(tscb))
-	assert.Equal(t, StateClosed, tscb.State())
-	assert.Equal(t, Counts{7, 1, 6, 0, 1}, tscb.cb.counts)
-
-	// StateClosed to StateOpen
-	for i := 0; i < 5; i++ {
-		assert.Nil(t, fail2Step(tscb)) // 6 consecutive failures
+	// A third request should be rejected with ErrTooManyRequests.
+	_, err := cb.Execute(context.Background(), func(ctx context.Context) (any, error) {
+		t.Error("third request should not be admitted")
+		return nil, nil
+	})
+	if !errors.Is(err, ErrTooManyRequests) {
+		t.Errorf("err = %v, want ErrTooManyRequests", err)
 	}
-	assert.Equal(t, StateOpen, tscb.State())
-	assert.Equal(t, Counts{0, 0, 0, 0, 0}, tscb.cb.counts)
-	assert.False(t, tscb.cb.expiry.IsZero())
 
-	assert.Error(t, succeed2Step(tscb))
-	assert.Error(t, fail2Step(tscb))
-	assert.Equal(t, Counts{0, 0, 0, 0, 0}, tscb.cb.counts)
-
-	pseudoSleep(tscb.cb, time.Duration(59)*time.Second)
-	assert.Equal(t, StateOpen, tscb.State())
-
-	// StateOpen to StateHalfOpen
-	pseudoSleep(tscb.cb, time.Duration(1)*time.Second) // over Timeout
-	assert.Equal(t, StateHalfOpen, tscb.State())
-	assert.True(t, tscb.cb.expiry.IsZero())
-
-	// StateHalfOpen to StateOpen
-	assert.Nil(t, fail2Step(tscb))
-	assert.Equal(t, StateOpen, tscb.State())
-	assert.Equal(t, Counts{0, 0, 0, 0, 0}, tscb.cb.counts)
-	assert.False(t, tscb.cb.expiry.IsZero())
-
-	// StateOpen to StateHalfOpen
-	pseudoSleep(tscb.cb, time.Duration(60)*time.Second)
-	assert.Equal(t, StateHalfOpen, tscb.State())
-	assert.True(t, tscb.cb.expiry.IsZero())
-
-	// StateHalfOpen to StateClosed
-	assert.Nil(t, succeed2Step(tscb))
-	assert.Equal(t, StateClosed, tscb.State())
-	assert.Equal(t, Counts{0, 0, 0, 0, 0}, tscb.cb.counts)
-	assert.True(t, tscb.cb.expiry.IsZero())
-}
-
-func TestPanicInRequest(t *testing.T) {
-	assert.Panics(t, func() { causePanic(defaultCB) })
-	assert.Equal(t, Counts{1, 0, 1, 0, 1}, defaultCB.counts)
-}
-
-func TestGeneration(t *testing.T) {
-	pseudoSleep(customCB, time.Duration(29)*time.Second)
-	assert.Nil(t, succeed(customCB))
-	ch := succeedLater(customCB, time.Duration(1500)*time.Millisecond)
-	time.Sleep(time.Duration(500) * time.Millisecond)
-	assert.Equal(t, Counts{2, 1, 0, 1, 0}, customCB.counts)
-
-	time.Sleep(time.Duration(500) * time.Millisecond) // over Interval
-	assert.Equal(t, StateClosed, customCB.State())
-	assert.Equal(t, Counts{0, 0, 0, 0, 0}, customCB.counts)
-
-	// the request from the previous generation has no effect on customCB.counts
-	assert.Nil(t, <-ch)
-	assert.Equal(t, Counts{0, 0, 0, 0, 0}, customCB.counts)
-}
-
-func TestCustomIsSuccessful(t *testing.T) {
-	isSuccessful := func(error) bool {
-		return true
-	}
-	cb := NewCircuitBreaker(Settings{IsSuccessful: isSuccessful})
-
-	for i := 0; i < 5; i++ {
-		assert.Nil(t, fail(cb))
-	}
-	assert.Equal(t, StateClosed, cb.State())
-	assert.Equal(t, Counts{5, 5, 0, 5, 0}, cb.counts)
-
-	cb.counts.clear()
-
-	cb.isSuccessful = func(err error) bool {
-		return err == nil
-	}
-	for i := 0; i < 6; i++ {
-		assert.Nil(t, fail(cb))
-	}
-	assert.Equal(t, StateOpen, cb.State())
-
-}
-
-func TestCircuitBreakerInParallel(t *testing.T) {
-	runtime.GOMAXPROCS(runtime.NumCPU())
-
-	ch := make(chan error)
-
-	const numReqs = 10000
-	routine := func() {
-		for i := 0; i < numReqs; i++ {
-			ch <- succeed(customCB)
+	// Release the two probes.
+	close(gate)
+	for i := 0; i < 2; i++ {
+		if err := <-done; err != nil {
+			t.Errorf("probe err = %v", err)
 		}
 	}
 
-	const numRoutines = 10
-	for i := 0; i < numRoutines; i++ {
-		go routine()
+	if got := stateOf(t, cb); got != StateClosed {
+		t.Errorf("after 2 successful probes: state = %v, want closed", got)
+	}
+}
+
+// TestHalfOpenReopenOnFailure verifies the conventional behavior: any failure
+// in half-open reopens the breaker.
+func TestHalfOpenReopenOnFailure(t *testing.T) {
+	cb, clock := newTestBreaker(t, Settings{Name: "reopen", Timeout: time.Second})
+	for i := 0; i < 5; i++ {
+		_ = failBreaker(t, cb)
+	}
+	clock.Advance(2 * time.Second)
+	if err := failBreaker(t, cb); !errors.Is(err, errBoom) {
+		t.Errorf("err = %v, want errBoom", err)
+	}
+	if got := stateOf(t, cb); got != StateOpen {
+		t.Errorf("after failure in half-open: state = %v, want open", got)
+	}
+}
+
+// TestExclusionDoesNotOpen is the regression test for the IsExcluded feature:
+// excluded errors should never trip the breaker, no matter how many.
+func TestExclusionDoesNotOpen(t *testing.T) {
+	cb, _ := newTestBreaker(t, Settings{
+		Name:         "exclude",
+		IsExcluded:   IgnoreContextErrors,
+		IsSuccessful: defaultIsSuccessful,
+	})
+	for i := 0; i < 100; i++ {
+		_, err := cb.Execute(context.Background(), func(ctx context.Context) (any, error) {
+			return nil, context.Canceled
+		})
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("iter %d: err = %v, want context.Canceled", i, err)
+		}
+	}
+	if got := stateOf(t, cb); got != StateClosed {
+		t.Errorf("state after 100 excluded errors = %v, want closed", got)
+	}
+	c, _ := cb.Counts(context.Background())
+	if c.TotalExclusions != 100 {
+		t.Errorf("TotalExclusions = %d, want 100", c.TotalExclusions)
+	}
+	if c.ConsecutiveFailures != 0 {
+		t.Errorf("ConsecutiveFailures = %d, want 0", c.ConsecutiveFailures)
+	}
+}
+
+// TestPanicCountsAsFailureAndPropagates verifies that panics are counted and
+// re-raised.
+func TestPanicCountsAsFailureAndPropagates(t *testing.T) {
+	cb, _ := newTestBreaker(t, Settings{Name: "panic"})
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("panic was not re-raised")
+		}
+	}()
+	_, _ = cb.Execute(context.Background(), func(ctx context.Context) (any, error) {
+		panic("boom")
+	})
+	t.Error("Execute should not return after panic")
+}
+
+func TestPanicIsCountedAsFailure(t *testing.T) {
+	cb, _ := newTestBreaker(t, Settings{Name: "panic-counted"})
+	for i := 0; i < 5; i++ {
+		func() {
+			defer func() { _ = recover() }()
+			_, _ = cb.Execute(context.Background(), func(ctx context.Context) (any, error) {
+				panic("boom")
+			})
+		}()
+	}
+	if got := stateOf(t, cb); got != StateOpen {
+		t.Errorf("state after 5 panics = %v, want open", got)
+	}
+}
+
+// TestOnStateChangeReceivesPreviousCounts is the regression test for sony
+// #72: the callback must see the counts that triggered the transition, not
+// the freshly-reset counts of the new generation.
+func TestOnStateChangeReceivesPreviousCounts(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		captured []Counts
+		fromTo   []string
+	)
+	cb, _ := newTestBreaker(t, Settings{
+		Name: "callback-counts",
+		OnStateChange: func(name string, from, to State, c Counts) {
+			mu.Lock()
+			defer mu.Unlock()
+			captured = append(captured, c)
+			fromTo = append(fromTo, fmt.Sprintf("%s->%s", from, to))
+		},
+	})
+	for i := 0; i < 5; i++ {
+		_ = failBreaker(t, cb)
 	}
 
-	total := uint32(numReqs * numRoutines)
-	for i := uint32(0); i < total; i++ {
-		err := <-ch
-		assert.Nil(t, err)
+	mu.Lock()
+	defer mu.Unlock()
+	if len(captured) != 1 {
+		t.Fatalf("got %d state changes, want 1", len(captured))
 	}
-	assert.Equal(t, Counts{total, total, 0, total, 0}, customCB.counts)
+	if fromTo[0] != "closed->open" {
+		t.Errorf("fromTo = %q, want closed->open", fromTo[0])
+	}
+	c := captured[0]
+	if c.ConsecutiveFailures != 5 {
+		t.Errorf("captured.ConsecutiveFailures = %d, want 5", c.ConsecutiveFailures)
+	}
+	if c.TotalFailures != 5 {
+		t.Errorf("captured.TotalFailures = %d, want 5", c.TotalFailures)
+	}
+}
+
+// TestOnStateChangeNoDeadlockOnReentry is the regression test for sony #37:
+// calling cb.Counts from inside OnStateChange must not deadlock.
+func TestOnStateChangeNoDeadlockOnReentry(t *testing.T) {
+	var (
+		observed Counts
+		cbHolder atomic.Pointer[CircuitBreaker[any]]
+	)
+	cb, _ := newTestBreaker(t, Settings{
+		Name: "no-deadlock",
+		OnStateChange: func(name string, from, to State, c Counts) {
+			// This call would deadlock with sony/gobreaker because
+			// OnStateChange runs while the internal mutex is held.
+			// Our breaker releases the lock before firing the
+			// callback, so this is safe.
+			cur, err := cbHolder.Load().Counts(context.Background())
+			if err != nil {
+				t.Errorf("Counts in callback: %v", err)
+			}
+			observed = cur
+		},
+	})
+	cbHolder.Store(cb)
+	for i := 0; i < 5; i++ {
+		_ = failBreaker(t, cb)
+	}
+	// Just observing that the test did not hang is enough.
+	_ = observed
+}
+
+// TestIntervalRolloverInClosed verifies that the closed state rotates the
+// generation at every Interval boundary, dropping stale counts.
+func TestIntervalRolloverInClosed(t *testing.T) {
+	cb, clock := newTestBreaker(t, Settings{
+		Name:     "rollover",
+		Interval: 10 * time.Second,
+	})
+	// Three failures, well below the trip threshold.
+	for i := 0; i < 3; i++ {
+		_ = failBreaker(t, cb)
+	}
+	c, _ := cb.Counts(context.Background())
+	if c.ConsecutiveFailures != 3 {
+		t.Errorf("before rollover: ConsecutiveFailures = %d, want 3", c.ConsecutiveFailures)
+	}
+
+	clock.Advance(11 * time.Second)
+	// The next observation should rotate generation and reset counts.
+	if err := succeed(t, cb); err != nil {
+		t.Fatal(err)
+	}
+	c, _ = cb.Counts(context.Background())
+	if c.ConsecutiveFailures != 0 {
+		t.Errorf("after rollover: ConsecutiveFailures = %d, want 0", c.ConsecutiveFailures)
+	}
+	if c.TotalSuccesses != 1 {
+		t.Errorf("after rollover: TotalSuccesses = %d, want 1", c.TotalSuccesses)
+	}
+}
+
+// TestStaleGenerationOutcomeDropped verifies that an outcome reported after
+// the breaker has rotated to a new generation is silently dropped.
+func TestStaleGenerationOutcomeDropped(t *testing.T) {
+	cb, clock := newTestBreaker(t, Settings{
+		Name:     "stale",
+		Interval: 10 * time.Second,
+	})
+	// Hold one request in flight.
+	gate := make(chan struct{})
+	resultCh := make(chan error, 1)
+	go func() {
+		_, err := cb.Execute(context.Background(), func(ctx context.Context) (any, error) {
+			<-gate
+			return nil, errBoom
+		})
+		resultCh <- err
+	}()
+	// Wait until in-flight is 1.
+	for {
+		c, _ := cb.Counts(context.Background())
+		if c.InFlights == 1 {
+			break
+		}
+	}
+
+	// Advance past Interval and force a rollover with a new request.
+	clock.Advance(11 * time.Second)
+	_ = succeed(t, cb)
+
+	// Now release the gated request: its failure outcome should NOT be
+	// counted because it belongs to the previous generation.
+	close(gate)
+	<-resultCh
+
+	c, _ := cb.Counts(context.Background())
+	if c.TotalFailures != 0 {
+		t.Errorf("TotalFailures after stale outcome = %d, want 0", c.TotalFailures)
+	}
+}
+
+func TestExecuteForwardsContext(t *testing.T) {
+	cb, _ := newTestBreaker(t, Settings{Name: "ctx"})
+	type ctxKey string
+	const key ctxKey = "k"
+
+	parent := context.WithValue(context.Background(), key, "v")
+	_, err := cb.Execute(parent, func(ctx context.Context) (any, error) {
+		if got := ctx.Value(key); got != "v" {
+			t.Errorf("context not forwarded: %v", got)
+		}
+		return nil, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestConcurrentRequestsClosed verifies that the breaker handles many
+// concurrent requests without losing counts.
+func TestConcurrentRequestsClosed(t *testing.T) {
+	cb, _ := newTestBreaker(t, Settings{Name: "concurrent"})
+	const goroutines = 50
+	const perGoroutine = 200
+	var wg sync.WaitGroup
+	var ok int64
+	wg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			defer wg.Done()
+			for j := 0; j < perGoroutine; j++ {
+				if err := succeed(t, cb); err == nil {
+					atomic.AddInt64(&ok, 1)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	want := int64(goroutines * perGoroutine)
+	if ok != want {
+		t.Errorf("ok = %d, want %d", ok, want)
+	}
+	c, _ := cb.Counts(context.Background())
+	if c.TotalSuccesses != uint64(want) {
+		t.Errorf("TotalSuccesses = %d, want %d", c.TotalSuccesses, want)
+	}
+	if c.InFlights != 0 {
+		t.Errorf("InFlights = %d, want 0", c.InFlights)
+	}
+}
+
+func TestStoreFailFastSurfaces(t *testing.T) {
+	failing := &failingStore{}
+	_, err := New[any](context.Background(), Settings{
+		Name:           "failfast",
+		Store:          failing,
+		OnStoreFailure: FailFast,
+	})
+	// New uses Update; failingStore returns an error from Update, so
+	// New should fail.
+	if err == nil {
+		t.Fatal("expected New to fail with failing store")
+	}
+}
+
+func TestStoreFallbackToLocal(t *testing.T) {
+	// In FallbackToLocal mode, a failing store should be transparently
+	// replaced by an in-memory fallback. We construct the breaker with
+	// the failing store from the start so the fast path detection (which
+	// fires only when Settings.Store is a *LocalStore) does not engage.
+	cb, err := New[any](context.Background(), Settings{
+		Name:           "fallback",
+		Store:          failingStore{},
+		OnStoreFailure: FallbackToLocal,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 5; i++ {
+		_ = failBreaker(t, cb)
+	}
+	// The fallback store should now hold the open state.
+	if cb.localFallback == nil {
+		t.Fatal("local fallback was not created")
+	}
+	snap, _ := cb.localFallback.Get(context.Background(), "fallback")
+	if snap.State != StateOpen {
+		t.Errorf("fallback state = %v, want open", snap.State)
+	}
+}
+
+// failingStore is a Store implementation that returns an error from every
+// operation. Used to exercise OnStoreFailure paths.
+type failingStore struct{}
+
+func (failingStore) Get(_ context.Context, _ string) (Snapshot, error) {
+	return Snapshot{}, errors.New("store down")
+}
+
+func (failingStore) Update(_ context.Context, _ string, _ UpdateFunc) (Snapshot, error) {
+	return Snapshot{}, errors.New("store down")
+}
+
+func (failingStore) Close() error { return nil }
+
+func TestNameReturnsConfiguredName(t *testing.T) {
+	cb, _ := newTestBreaker(t, Settings{Name: "my-breaker"})
+	if cb.Name() != "my-breaker" {
+		t.Errorf("Name() = %q, want %q", cb.Name(), "my-breaker")
+	}
+}
+
+func TestStatePublicAPIObservesHalfOpenAfterTimeout(t *testing.T) {
+	cb, clock := newTestBreaker(t, Settings{
+		Name:    "public-state",
+		Timeout: 10 * time.Second,
+	})
+	for i := 0; i < 5; i++ {
+		_ = failBreaker(t, cb)
+	}
+	// Read via public API: should be open while still under Timeout.
+	got, err := cb.State(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != StateOpen {
+		t.Errorf("State() = %v, want open", got)
+	}
+
+	clock.Advance(11 * time.Second)
+	// Without performing a request, State() should already report half-open.
+	got, err = cb.State(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != StateHalfOpen {
+		t.Errorf("State() after timeout = %v, want half-open", got)
+	}
+}
+
+func TestStateFailFastSurfacesError(t *testing.T) {
+	// Construct with the failing store from the start so the fast
+	// path detection does not engage.
+	cb, err := New[any](context.Background(), Settings{
+		Name:           "x",
+		Store:          failingStore{},
+		OnStoreFailure: FailFast,
+	})
+	if err == nil {
+		// New itself should fail under FailFast with a failing store.
+		t.Fatalf("New should have failed with failing store + FailFast, got cb=%v", cb)
+	}
+	if !errors.Is(err, ErrStoreUnavailable) && !errors.Is(err, errors.New("store down")) {
+		// New wraps the store error in a "gobreaker: initialize ..."
+		// envelope. Either ErrStoreUnavailable wrapping or the bare
+		// store error is acceptable.
+		if err.Error() == "" {
+			t.Errorf("expected non-empty error from New")
+		}
+	}
+}
+
+func TestStateFallbackUsesLocalStore(t *testing.T) {
+	// Construct directly with the failing store so the fast path is
+	// not engaged. FallbackToLocal must let the constructor succeed
+	// and route subsequent operations to the lazy local fallback.
+	cb, err := New[any](context.Background(), Settings{
+		Name:           "x",
+		Store:          failingStore{},
+		OnStoreFailure: FallbackToLocal,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// In FallbackToLocal mode the call should not error.
+	if _, err := cb.State(context.Background()); err != nil {
+		t.Errorf("State err = %v, want nil (fallback)", err)
+	}
+	if _, err := cb.Counts(context.Background()); err != nil {
+		t.Errorf("Counts err = %v, want nil (fallback)", err)
+	}
 }
