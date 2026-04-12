@@ -127,7 +127,7 @@ func (cb *CircuitBreaker[T]) forceStateFast(target State) error {
 	snap.GenerationStart = now
 	switch target {
 	case StateClosed:
-		snap.Expiry = cb.closedExpiry(now)
+		snap.Expiry = closedExpiryFor(now, settings.Interval)
 	case StateOpen:
 		snap.Expiry = now.Add(settings.Timeout)
 	case StateHalfOpen:
