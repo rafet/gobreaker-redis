@@ -19,9 +19,11 @@
 package httpmw
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 
 	gobreaker "github.com/rafet/gobreaker-redis/v2"
@@ -130,7 +132,9 @@ func WrapGroup(g *gobreaker.Group[int], keyFn KeyFunc, next http.Handler, opts .
 }
 
 // statusRecorder intercepts WriteHeader to capture the status code
-// without buffering the full response.
+// without buffering the full response. It forwards http.Flusher and
+// http.Hijacker to the underlying ResponseWriter so SSE and WebSocket
+// handlers work correctly behind the middleware.
 type statusRecorder struct {
 	http.ResponseWriter
 	statusCode  int
@@ -150,4 +154,27 @@ func (r *statusRecorder) Write(b []byte) (int, error) {
 		r.WriteHeader(http.StatusOK)
 	}
 	return r.ResponseWriter.Write(b)
+}
+
+// Flush forwards to the underlying ResponseWriter if it implements
+// http.Flusher (needed for SSE / chunked transfer).
+func (r *statusRecorder) Flush() {
+	if f, ok := r.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// Hijack forwards to the underlying ResponseWriter if it implements
+// http.Hijacker (needed for WebSocket upgrade).
+func (r *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if h, ok := r.ResponseWriter.(http.Hijacker); ok {
+		return h.Hijack()
+	}
+	return nil, nil, fmt.Errorf("httpmw: underlying ResponseWriter does not implement http.Hijacker")
+}
+
+// Unwrap returns the underlying ResponseWriter so middleware-aware
+// code (e.g. http.ResponseController) can access the original.
+func (r *statusRecorder) Unwrap() http.ResponseWriter {
+	return r.ResponseWriter
 }

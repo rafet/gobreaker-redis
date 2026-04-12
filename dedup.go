@@ -49,6 +49,12 @@ func NewDeduplicator[T any](cb *CircuitBreaker[T]) *Deduplicator[T] {
 // The deduplication scope is the in-flight window: once the original
 // request completes (success, failure, or panic), the key is removed
 // and subsequent calls dispatch a fresh request.
+//
+// IMPORTANT: waiters do NOT respect their own context. If the original
+// request is slow, a waiter whose context is cancelled will still
+// block until the original completes. This matches the behavior of
+// golang.org/x/sync/singleflight. If you need context-aware waiting,
+// wrap ExecuteDedup in a goroutine with a select on ctx.Done().
 func (d *Deduplicator[T]) ExecuteDedup(ctx context.Context, key string, req func(ctx context.Context) (T, error)) (T, error) {
 	d.mu.Lock()
 	if c, ok := d.in[key]; ok {
