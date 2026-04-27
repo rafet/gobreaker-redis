@@ -159,6 +159,10 @@ See [docs/BACKENDS.md](docs/BACKENDS.md) for configuration recipes.
 - [MIGRATION.md](docs/MIGRATION.md) — v1 to v2 migration guide
 - [CONTRIBUTING.md](CONTRIBUTING.md) — test discipline and conventions
 
+## Credits
+
+Originally inspired by [sony/gobreaker](https://github.com/sony/gobreaker) (Apache-2.0). This project diverged in August 2023 and v2 is an independent rewrite — generic API, Lua-CAS distributed store, and a separate feature set (hedging, dedup, pipeline, adaptive thresholds, ramp admission, group breakers). It is not a drop-in replacement and does not track upstream. See [docs/upstream-divergence.md](docs/upstream-divergence.md).
+
 ## License
 
 MIT
